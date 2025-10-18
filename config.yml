@@ -1,0 +1,57 @@
+# config.yml — multi-exchange, env-driven
+# Comma-separated list of exchanges (ccxt names)
+exchanges: ${EXCHANGES}
+
+# Separate lists (comma-separated pairs), applied across exchanges
+symbols_day: ${DAY_SYMBOLS}
+symbols_trend: ${TREND_SYMBOLS}
+
+telegram:
+  enabled: false            # start with alerts OFF; flip to true later
+  bot_token: ${BOT_TOKEN}
+  chat_id: ${CHAT_ID}
+
+day_trade_params:
+  lookback_high: 20
+  vol_sma: 20
+  rsi_min: 50
+  rsi_max: 80
+  btc_filter: true
+  btc_symbol: BTC/USDT
+  btc_ema: 20
+  stop_mode: swing
+  atr_mult: 1.5
+
+trend_trade_params:
+  ema20: 20
+  ema50: 50
+  ema100: 100
+  pullback_pct_max: 12.0
+  rsi_min: 50
+  rsi_max: 70
+  vol_sma: 20
+  breakout_lookback: 55
+  stop_mode: swing
+  atr_mult: 2.0
+
+supply_demand:
+  enabled: true
+  mode: prefer
+  timeframe_for_zones: 1h
+  lookback: 300
+  impulse_factor: 1.8
+  zone_padding_pct: 0.25
+  max_age_bars: 300
+
+# Movers via CoinMarketCap — adds candidates to DAY list (per exchange), then filters with TA
+movers:
+  enabled: true
+  source: cmc
+  cmc_api_key: ${CMC_API_KEY}
+  limit: 200
+  min_change_24h: 15.0
+  min_volume_usd_24h: 2000000
+  max_age_days: 365
+  include_symbols: ""       # leave empty — no whitelist
+  exclude_symbols: ""
+  quote: "USDT"

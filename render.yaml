@@ -1,0 +1,21 @@
+# render.yaml — deploy as a Cron Job on Render (multi-exchange)
+services:
+  - type: cron
+    name: crypto-signal-scanner
+    env: python
+    schedule: "*/15 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python multi_sd_scanner.py --config config.yml
+    envVars:
+      - key: EXCHANGES
+        sync: false
+      - key: DAY_SYMBOLS
+        sync: false
+      - key: TREND_SYMBOLS
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: CMC_API_KEY
+        sync: false
