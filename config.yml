@@ -13,7 +13,7 @@ telegram:
 
 discord:
   enabled: true
-  webhook: ${DISCORD_WEBHOOK}
+  webhook: https://discord.com/api/webhooks/1429125113780899981/8jqvbb4Idij4GFWvFqaCGPdT2NBDnloP_aoleyY4Czxop0Gvfmv8kqQN019ynqmFb1y2
 
 
 day_trade_params:
