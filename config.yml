@@ -11,6 +11,11 @@ telegram:
   bot_token: ${BOT_TOKEN}
   chat_id: ${CHAT_ID}
 
+discord:
+  enabled: true
+  webhook: ${DISCORD_WEBHOOK}
+
+
 day_trade_params:
   lookback_high: 20
   vol_sma: 20
