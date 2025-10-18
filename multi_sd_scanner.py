@@ -8,6 +8,7 @@ multi_sd_scanner.py — Render Cron scanner with multi-exchange support
 - Optional Supply/Demand zone confluence
 - Optional BTC EMA filter for day trades
 - Optional Telegram notifications (off by default)
+- Optional Discord webhook notifications (off by default)
 - Safe has_pair() (handles None .symbols in ccxt)
 
 Start command for Render Cron:
@@ -431,21 +432,24 @@ def run(cfg: Dict[str,Any]):
             )
         except Exception as e:
             print("[telegram] err:", e)
-    
-    # optional discord notifications
-dcfg = cfg.get("discord", {"enabled": False})
-if dcfg.get("enabled") and results["signals"]:
-    try:
-        import requests
-        lines = ["**Crypto Signals**"]
-        for s in results["signals"]:
-            sd_tag = " ✅SD" if s.get("sd_confluence") else ""
-            lines.append(f"**[{s['exchange']}] {s['symbol']}** ({s['timeframe']} {s['type'].upper()}) — {s['note']}{sd_tag}\n"
-                         f"entry `{s['entry']}` stop `{s['stop']}` t1 `{s['t1']}` t2 `{s['t2']}`")
-        requests.post(dcfg["webhook"], json={"content": "\n".join(lines)}, timeout=10)
-    except Exception as e:
-        print("[discord] err:", e)
-	
+
+    # optional discord webhook
+    dcfg = cfg.get("discord", {"enabled": False})
+    if dcfg.get("enabled"):
+        try:
+            import requests
+            if results["signals"]:
+                # Send one consolidated message
+                lines = ["**Crypto Signals**"]
+                for s in results["signals"]:
+                    sd_tag = " ✅SD" if s.get("sd_confluence") else ""
+                    lines.append(
+                        f"**[{s['exchange']}] {s['symbol']}** ({s['timeframe']} {s['type'].upper()}) — {s['note']}{sd_tag}\n"
+                        f"entry `{s['entry']}` stop `{s['stop']}` t1 `{s['t1']}` t2 `{s['t2']}`"
+                    )
+                requests.post(dcfg["webhook"], json={"content": "\n".join(lines)}, timeout=10)
+        except Exception as e:
+            print("[discord] err:", e)
 
     return results
 
