@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json, os, time, yaml, requests
-from dataclasses import dataclass
+import argparse, json, os, yaml, requests
+from dataclasses import dataclass, field
 from typing import Dict, Any, List, Tuple, Set
 import pandas as pd
 import numpy as np
@@ -55,6 +55,9 @@ class DayParams:
     btc_ema: int = 20
     stop_mode: str = "swing"
     atr_mult: float = 1.5
+    # allow nested config without crashing
+    early_reversal: dict = field(default_factory=dict)
+    multi_tf: dict = field(default_factory=dict)
 
 @dataclass
 class TrendParams:
@@ -235,6 +238,7 @@ def remove_position(state:Dict[str,Any], exchange:str, pair:str, sig_type:str):
     ap.pop(pos_key(exchange,pair,sig_type), None)
 
 # ================== Day Exits (1h) with optional multi-TF ==================
+from typing import Tuple
 def day_exit(df:pd.DataFrame, cfg:Dict[str,Any])->Tuple[bool,str]:
     if len(df)<50: return False,""
     r = rsi(df['close'],14); e20 = ema(df['close'], cfg.get("ema_break",20))
@@ -425,15 +429,15 @@ def run(cfg: Dict[str,Any]):
 
                 # Multi-TF confirm for DAY entries
                 tf_ok_count = 0; mtf_need = 0
-                if sig and cfg.get("day_trade_params", {}).get("multi_tf", {}).get("enabled", False):
-                    mtf = cfg["day_trade_params"]["multi_tf"]
-                    tfs = mtf.get("confirm_tfs", ["5m","15m","30m"]); mtf_need = int(mtf.get("min_confirmations", 3))
+                day_multi = dayP.multi_tf or {}
+                if sig and day_multi.get("enabled", False):
+                    tfs = day_multi.get("confirm_tfs", ["5m","15m","30m"]); mtf_need = int(day_multi.get("min_confirmations", 3))
                     mdfs = fetch_multi_tf(client, pair, tfs, 200)
                     for tf in tfs:
                         if tf_bull_ok(mdfs.get(tf),
-                                      require_ema_stack=mtf.get("require_ema_stack", True),
-                                      require_macd_bull=mtf.get("require_macd_bull", True),
-                                      min_rsi=mtf.get("min_rsi", 52)):
+                                      require_ema_stack=day_multi.get("require_ema_stack", True),
+                                      require_macd_bull=day_multi.get("require_macd_bull", True),
+                                      min_rsi=day_multi.get("min_rsi", 52)):
                             tf_ok_count += 1
                     if tf_ok_count < mtf_need: sig = None
 
@@ -444,8 +448,7 @@ def run(cfg: Dict[str,Any]):
                         sig = None
                     # liquidity (1h dollar vol)
                     if sig:
-                        df1h_liq = df1h  # already fetched
-                        if avg_dollar_vol(df1h_liq, 24) < qcfg.get("min_avg_dollar_vol_1h", 200000): sig = None
+                        if avg_dollar_vol(df1h, 24) < qcfg.get("min_avg_dollar_vol_1h", 200000): sig = None
                     # two-close for breakouts
                     if sig and qcfg.get("require_two_closes_breakout", True) and "level" in sig and "Breakout" in sig["note"]:
                         if not two_close_confirm(df1h, sig["level"], "above"): sig = None
@@ -469,7 +472,7 @@ def run(cfg: Dict[str,Any]):
                 tf=swingP.get("timeframe","4h"); df4h=client.ohlcv(pair, tf, 400)
                 zones = zones_cache.get((ex_name, pair))
                 sig = swing_signal(df4h, swingP, sd_cfg, zones)
-                # Quality: cooldown, liquidity, two-close (if breakout), confidence (simple)
+                # Quality: cooldown, liquidity, two-close (if breakout), confidence
                 if sig:
                     if not cooldown_ok((ex_name, pair, tf, sig['type']), qcfg.get("signal_cooldown_bars", 6), pd.Timestamp.utcnow(), tf): sig=None
                 if sig:
@@ -528,15 +531,16 @@ def run(cfg: Dict[str,Any]):
                     df1h = client.ohlcv(pair,"1h",200)
                     ok, why = day_exit(df1h, exits_cfg.get("day", {}))
                     # multi-TF confirm
-                    if ok and exits_cfg.get("day", {}).get("multi_tf", {}).get("enabled", True):
-                        mtf = exits_cfg["day"]["multi_tf"]; tfs = mtf.get("confirm_tfs", ["5m","15m","30m"])
-                        need = int(mtf.get("min_confirmations", 3)); bears = 0
+                    day_mtf = exits_cfg.get("day", {}).get("multi_tf", {})
+                    if ok and day_mtf.get("enabled", True):
+                        tfs = day_mtf.get("confirm_tfs", ["5m","15m","30m"])
+                        need = int(day_mtf.get("min_confirmations", 3)); bears = 0
                         mdfs = fetch_multi_tf(client, pair, tfs, 200)
                         for tf in tfs:
                             if tf_bear_ok(mdfs.get(tf),
-                                          require_ema_bear=mtf.get("require_ema_bear", True),
-                                          require_macd_bear=mtf.get("require_macd_bear", True),
-                                          max_rsi=mtf.get("max_rsi", 50)):
+                                          require_ema_bear=day_mtf.get("require_ema_bear", True),
+                                          require_macd_bear=day_mtf.get("require_macd_bear", True),
+                                          max_rsi=day_mtf.get("max_rsi", 50)):
                                 bears += 1
                         if bears < need: ok=False; why = why+" (no multi-TF bearish confirm)"
                     if ok:
@@ -574,15 +578,16 @@ def run(cfg: Dict[str,Any]):
                     zones = zones_cache.get((ex_name, pair))
                     sig = day_bearish_signal(df1h, bearish_cfg, sd_cfg, zones)
                     # two-close breakdown confirm
-                    if sig and cfg.get("quality", {}).get("require_two_closes_breakout", True):
+                    if sig and qcfg.get("require_two_closes_breakout", True):
                         if not two_close_confirm(df1h, sig["level"], "below"): sig=None
                     # liquidity & cooldown
                     if sig:
                         if avg_dollar_vol(df1h, 24) < qcfg.get("min_avg_dollar_vol_1h", 200000): sig=None
                         if not cooldown_ok((ex_name, pair, "1h", sig['type']), qcfg.get("signal_cooldown_bars", 6), pd.Timestamp.utcnow(), "1h"): sig=None
                     # multi-TF bearish confirm
-                    if sig and bearish_cfg.get("day", {}).get("multi_tf", {}).get("enabled", True):
-                        mtf = bearish_cfg["day"]["multi_tf"]; tfs = mtf.get("confirm_tfs", ["5m","15m","30m"])
+                    mtf = bearish_cfg.get("day", {}).get("multi_tf", {})
+                    if sig and mtf.get("enabled", True):
+                        tfs = mtf.get("confirm_tfs", ["5m","15m","30m"])
                         need = int(mtf.get("min_confirmations", 3)); bears = 0
                         mdfs = fetch_multi_tf(client, pair, tfs, 200)
                         for tf in tfs:
