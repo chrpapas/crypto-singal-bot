@@ -1,13 +1,10 @@
-# config.yml — multi-exchange, env-driven
-# Comma-separated list of exchanges (ccxt names)
+# Exchanges & universe
 exchanges: ${EXCHANGES}
+symbols_watchlist: ${SYMBOLS_WATCHLIST}
 
-# Separate lists (comma-separated pairs), applied across exchanges
-symbols_day: ${DAY_SYMBOLS}
-symbols_trend: ${TREND_SYMBOLS}
-
+# Notifications
 telegram:
-  enabled: false            # start with alerts OFF; flip to true later
+  enabled: false
   bot_token: ${BOT_TOKEN}
   chat_id: ${CHAT_ID}
 
@@ -15,23 +12,64 @@ discord:
   enabled: true
   webhook: https://discord.com/api/webhooks/1429125113780899981/8jqvbb4Idij4GFWvFqaCGPdT2NBDnloP_aoleyY4Czxop0Gvfmv8kqQN019ynqmFb1y2
 
+# Quality / anti-noise profile
+quality:
+  profile: "safe"                  # "safe" | "balanced" | "aggressive"
+  min_avg_dollar_vol_1h: 200000    # liquidity floor (avg $/1h over last 24 bars)
+  signal_cooldown_bars: 6          # min bars between signals for same pair/tf/type
+  require_two_closes_breakout: true
+  min_confidence: 70               # 0–100
 
+# DAY (1h)
 day_trade_params:
-  lookback_high: 20
-  vol_sma: 20
-  rsi_min: 50
-  rsi_max: 80
+  lookback_high: 30
+  vol_sma: 30
+  rsi_min: 52
+  rsi_max: 78
   btc_filter: true
   btc_symbol: BTC/USDT
   btc_ema: 20
   stop_mode: swing
   atr_mult: 1.5
 
+  # Early-reversal (optional, safer thresholds)
+  early_reversal:
+    enabled: true
+    require_ema_cross: true
+    require_macd_cross: true
+    min_rsi: 55
+    max_extension_pct: 6
+    min_vol_mult: 1.0
+
+  # Multi-timeframe confirmation for entries
+  multi_tf:
+    enabled: true
+    confirm_tfs: ["5m","15m","30m"]
+    min_confirmations: 3
+    require_ema_stack: true
+    require_macd_bull: true
+    min_rsi: 52
+
+# SWING (4h)
+swing_trade_params:
+  timeframe: "4h"
+  ema20: 20
+  ema50: 50
+  ema100: 100
+  pullback_pct_max: 10.0
+  rsi_min: 50
+  rsi_max: 70
+  vol_sma: 20
+  breakout_lookback: 34
+  stop_mode: swing
+  atr_mult: 1.8
+
+# TREND (1d)
 trend_trade_params:
   ema20: 20
   ema50: 50
   ema100: 100
-  pullback_pct_max: 12.0
+  pullback_pct_max: 10.0
   rsi_min: 50
   rsi_max: 70
   vol_sma: 20
@@ -39,6 +77,7 @@ trend_trade_params:
   stop_mode: swing
   atr_mult: 2.0
 
+# Supply/Demand
 supply_demand:
   enabled: true
   mode: prefer
@@ -48,15 +87,70 @@ supply_demand:
   zone_padding_pct: 0.25
   max_age_bars: 300
 
-# Movers via CoinMarketCap — adds candidates to DAY list (per exchange), then filters with TA
+# Movers: Top-500 by mcap + stronger filters
 movers:
   enabled: true
   source: cmc
   cmc_api_key: ${CMC_API_KEY}
-  limit: 200
+  limit: 500
   min_change_24h: 15.0
-  min_volume_usd_24h: 2000000
+  min_volume_usd_24h: 5000000
   max_age_days: 365
-  include_symbols: ""       # leave empty — no whitelist
-  exclude_symbols: ""
   quote: "USDT"
+
+# Exits (with day multi-TF bearish confirm)
+exits:
+  enabled: true
+  state_file: "state.json"
+  day:
+    rsi_drop_from: 70
+    rsi_drop_to: 60
+    ema_break: 20
+    macd_confirm: true
+    multi_tf:
+      enabled: true
+      confirm_tfs: ["5m","15m","30m"]
+      min_confirmations: 3
+      require_ema_bear: true
+      require_macd_bear: true
+      max_rsi: 50
+  swing:
+    rsi_below: 50
+    ema_break: 50
+    macd_confirm: true
+  trend:
+    rsi_below: 50
+    ema_cross_20_50: true
+    macd_confirm: true
+
+# Bearish setups (sell alerts)
+bearish_signals:
+  enabled: true
+  day:
+    timeframe: "1h"
+    lookback_low: 20
+    vol_sma: 20
+    rsi_max: 50
+    require_breakdown: true
+    require_vol_confirm: true
+    sd:
+      require_supply: false
+    multi_tf:
+      enabled: true
+      confirm_tfs: ["5m","15m","30m"]
+      min_confirmations: 3
+      require_ema_bear: true
+      require_macd_bear: true
+      max_rsi: 50
+  swing:
+    timeframe: "4h"
+    ema_stack_bear: true
+    lookback_low: 34
+    rsi_max: 50
+    require_vol_confirm: true
+  trend:
+    timeframe: "1d"
+    ema20_below_50: true
+    lookback_low: 55
+    rsi_max: 50
+    require_vol_confirm: false
