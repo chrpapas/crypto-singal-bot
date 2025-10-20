@@ -603,6 +603,69 @@ def trend_exit(df: pd.DataFrame, cfg: Dict[str,Any]):
         return True, "Trend momentum break"
     return False, ""
 
+# ================== Bearish signals (sell) ==================
+def tf_bull_ok(df: pd.DataFrame, *, require_ema_stack=True, require_macd_bull=True, min_rsi=50) -> bool:
+    if df is None or len(df) < 60: return False
+    e20 = ema(df['close'], 20); e50 = ema(df['close'], 50)
+    macd_line, macd_sig, _ = macd(df['close']); r = rsi(df['close'], 14)
+    ok=True
+    if require_ema_stack: ok &= (e20.iloc[-1] > e50.iloc[-1])
+    if require_macd_bull: ok &= (macd_line.iloc[-1] > macd_sig.iloc[-1])
+    ok &= (r.iloc[-1] >= min_rsi)
+    return bool(ok)
+def tf_bear_ok(df: pd.DataFrame, *, require_ema_bear=True, require_macd_bear=True, max_rsi=50) -> bool:
+    if df is None or len(df) < 60: return False
+    e20 = ema(df['close'], 20); e50 = ema(df['close'], 50)
+    macd_line, macd_sig, _ = macd(df['close']); r = rsi(df['close'], 14)
+    ok=True
+    if require_ema_bear: ok &= (e20.iloc[-1] < e50.iloc[-1])
+    if require_macd_bear: ok &= (macd_line.iloc[-1] < macd_sig.iloc[-1])
+    ok &= (r.iloc[-1] <= max_rsi)
+    return bool(ok)
+
+def day_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any], sd_cfg: Dict[str,Any], zones=None):
+    tf_cfg = cfg.get("day", {})
+    look = int(tf_cfg.get("lookback_low", 20)); voln = int(tf_cfg.get("vol_sma", 20))
+    if len(df) < max(look, voln) + 5: return None
+    lowlvl = df["low"].iloc[-(look+1):-1].min(); last = df.iloc[-1]; volS = sma(df["volume"], voln); r = rsi(df["close"], 14)
+    breakdown = last["close"] < lowlvl if tf_cfg.get("require_breakdown", True) else (last["low"] < lowlvl)
+    vol_ok = (last["volume"] > (volS.iloc[-1] if not np.isnan(volS.iloc[-1]) else last["volume"])) if tf_cfg.get("require_vol_confirm", True) else True
+    rsi_weak = r.iloc[-1] <= tf_cfg.get("rsi_max", 50)
+    if not (breakdown and vol_ok and rsi_weak): return None
+    if sd_cfg.get("enabled") and tf_cfg.get("sd", {}).get("require_supply", False):
+        in_supply = any(z["type"]=="supply" and z["low"]<=float(last["close"])<=z["high"] for z in (zones or []))
+        if not in_supply: return None
+    note = "Breakdown (1h) under lookback low"
+    invalidate = float(max(lowlvl, last["close"] + (last["high"] - last["low"]) * 0.5))
+    return {"type":"sell_day","note":note,"price":float(last["close"]),"invalidate_above":invalidate,"level":float(lowlvl)}
+
+def swing_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any]):
+    tf_cfg = cfg.get("swing", {})
+    if len(df) < 120: return None
+    e20, e50, e100 = ema(df["close"],20), ema(df["close"],50), ema(df["close"],100)
+    r = rsi(df["close"], 14); volS = sma(df["volume"], 20); last = df.iloc[-1]
+    ema_bear = (e20.iloc[-1] < e50.iloc[-1] < e100.iloc[-1]) if tf_cfg.get("ema_stack_bear", True) else True
+    lowlvl = df["low"].iloc[-(tf_cfg.get("lookback_low",34)+1):-1].min()
+    breakdown = last["close"] < lowlvl; rsi_weak = r.iloc[-1] <= tf_cfg.get("rsi_max", 50)
+    vol_ok = last["volume"] > volS.iloc[-1] if tf_cfg.get("require_vol_confirm", True) and not np.isnan(volS.iloc[-1]) else True
+    if not (ema_bear and breakdown and rsi_weak and vol_ok): return None
+    invalidate = float(e20.iloc[-1])
+    return {"type":"sell_swing","note":"Breakdown (4h) with bearish EMA stack","price":float(last["close"]),
+            "invalidate_above":invalidate,"level":float(lowlvl)}
+
+def trend_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any]):
+    tf_cfg = cfg.get("trend", {})
+    if len(df) < 200: return None
+    e20, e50 = ema(df["close"],20), ema(df["close"],50)
+    r = rsi(df["close"], 14); last = df.iloc[-1]
+    cross = (e20.iloc[-1] < e50.iloc[-1] and e20.iloc[-2] >= e50.iloc[-2]) if tf_cfg.get("ema20_below_50", True) else True
+    lowlvl = df["low"].iloc[-(tf_cfg.get("lookback_low",55)+1):-1].min()
+    breakdown = last["close"] < lowlvl; rsi_weak = r.iloc[-1] <= tf_cfg.get("rsi_max", 50)
+    if not (cross and breakdown and rsi_weak): return None
+    invalidate = float(e50.iloc[-1])
+    return {"type":"sell_trend","note":"Trend shift (1d): EMA20<50 + breakdown","price":float(last["close"]),
+            "invalidate_above":invalidate,"level":float(lowlvl)}
+
 # ================== Main run ==================
 def run(cfg: Dict[str,Any]):
     ex_names = parse_csv_env(cfg.get("exchanges") or "mexc")
@@ -1023,9 +1086,18 @@ def run(cfg: Dict[str,Any]):
                             c0,c1 = g["confidence_range"]
                             conf_txt = f" (conf {c0:.0f}–{c1:.0f})" if c0!=c1 else f" (conf {c0:.0f})"
                         e0,e1 = g["entry_range"]; s0,s1 = g["stop_range"]
+                        # include t1/t2 explicitly in Telegram
+                        t1rng = g.get("t1_range"); t2rng = g.get("t2_range")
+                        def _fmt_rng(a,b):
+                            if a is None or b is None: return "-"
+                            if abs(a-b) <= max(0.01, 0.001*max(abs(a),abs(b))):
+                                return f"{a:.4f}"
+                            return f"{a:.4f}–{b:.4f}"
+                        t1_txt = _fmt_rng(*t1rng) if t1rng else "-"
+                        t2_txt = _fmt_rng(*t2rng) if t2rng else "-"
                         parts.append(
                             f"• [{exs}] `{g['symbol']}` *{g['type'].upper()}* {g['timeframe']} — {g['note']}{sd_tag}{conf_txt}\n"
-                            f"  entry `{e0:.4f}`–`{e1:.4f}` stop `{s0:.4f}`–`{s1:.4f}`"
+                            f"  entry `{e0:.4f}`–`{e1:.4f}` stop `{s0:.4f}`–`{s1:.4f}` t1 `{t1_txt}` t2 `{t2_txt}`"
                         )
                 if exits_view:
                     parts.append("*Exits*")
@@ -1056,7 +1128,16 @@ def run(cfg: Dict[str,Any]):
                             c0,c1 = g["confidence_range"]
                             conf_txt = f" (conf {c0:.0f}–{c1:.0f})" if c0!=c1 else f" (conf {c0:.0f})"
                         e0,e1 = g["entry_range"]; s0,s1 = g["stop_range"]
-                        lines.append(f"**[{exs}] {g['symbol']}** ({g['timeframe']} {g['type'].upper()}) — {g['note']}{sd_tag}{conf_txt}\nentry `{e0:.4f}`–`{e1:.4f}` stop `{s0:.4f}`–`{s1:.4f}`")
+                        # include t1/t2 explicitly in Discord
+                        t1rng = g.get("t1_range"); t2rng = g.get("t2_range")
+                        def _fmt_rng(a,b):
+                            if a is None or b is None: return "-"
+                            if abs(a-b) <= max(0.01, 0.001*max(abs(a),abs(b))):
+                                return f"{a:.4f}"
+                            return f"{a:.4f}–{b:.4f}"
+                        t1_txt = _fmt_rng(*t1rng) if t1rng else "-"
+                        t2_txt = _fmt_rng(*t2rng) if t2rng else "-"
+                        lines.append(f"**[{exs}] {g['symbol']}** ({g['timeframe']} {g['type'].upper()}) — {g['note']}{sd_tag}{conf_txt}\nentry `{e0:.4f}`–`{e1:.4f}` stop `{s0:.4f}`–`{s1:.4f}` t1 `{t1_txt}` t2 `{t2_txt}`")
                 if exits_view:
                     lines.append("**Exits**")
                     for x in exits_view:
@@ -1072,69 +1153,6 @@ def run(cfg: Dict[str,Any]):
             except Exception as e: print("[discord] err:", e)
 
     return results
-
-# ================== Bearish signals (sell) ==================
-def tf_bull_ok(df: pd.DataFrame, *, require_ema_stack=True, require_macd_bull=True, min_rsi=50) -> bool:
-    if df is None or len(df) < 60: return False
-    e20 = ema(df['close'], 20); e50 = ema(df['close'], 50)
-    macd_line, macd_sig, _ = macd(df['close']); r = rsi(df['close'], 14)
-    ok=True
-    if require_ema_stack: ok &= (e20.iloc[-1] > e50.iloc[-1])
-    if require_macd_bull: ok &= (macd_line.iloc[-1] > macd_sig.iloc[-1])
-    ok &= (r.iloc[-1] >= min_rsi)
-    return bool(ok)
-def tf_bear_ok(df: pd.DataFrame, *, require_ema_bear=True, require_macd_bear=True, max_rsi=50) -> bool:
-    if df is None or len(df) < 60: return False
-    e20 = ema(df['close'], 20); e50 = ema(df['close'], 50)
-    macd_line, macd_sig, _ = macd(df['close']); r = rsi(df['close'], 14)
-    ok=True
-    if require_ema_bear: ok &= (e20.iloc[-1] < e50.iloc[-1])
-    if require_macd_bear: ok &= (macd_line.iloc[-1] < macd_sig.iloc[-1])
-    ok &= (r.iloc[-1] <= max_rsi)
-    return bool(ok)
-
-def day_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any], sd_cfg: Dict[str,Any], zones=None):
-    tf_cfg = cfg.get("day", {})
-    look = int(tf_cfg.get("lookback_low", 20)); voln = int(tf_cfg.get("vol_sma", 20))
-    if len(df) < max(look, voln) + 5: return None
-    lowlvl = df["low"].iloc[-(look+1):-1].min(); last = df.iloc[-1]; volS = sma(df["volume"], voln); r = rsi(df["close"], 14)
-    breakdown = last["close"] < lowlvl if tf_cfg.get("require_breakdown", True) else (last["low"] < lowlvl)
-    vol_ok = (last["volume"] > (volS.iloc[-1] if not np.isnan(volS.iloc[-1]) else last["volume"])) if tf_cfg.get("require_vol_confirm", True) else True
-    rsi_weak = r.iloc[-1] <= tf_cfg.get("rsi_max", 50)
-    if not (breakdown and vol_ok and rsi_weak): return None
-    if sd_cfg.get("enabled") and tf_cfg.get("sd", {}).get("require_supply", False):
-        in_supply = any(z["type"]=="supply" and z["low"]<=float(last["close"])<=z["high"] for z in (zones or []))
-        if not in_supply: return None
-    note = "Breakdown (1h) under lookback low"
-    invalidate = float(max(lowlvl, last["close"] + (last["high"] - last["low"]) * 0.5))
-    return {"type":"sell_day","note":note,"price":float(last["close"]),"invalidate_above":invalidate,"level":float(lowlvl)}
-
-def swing_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any]):
-    tf_cfg = cfg.get("swing", {})
-    if len(df) < 120: return None
-    e20, e50, e100 = ema(df["close"],20), ema(df["close"],50), ema(df["close"],100)
-    r = rsi(df["close"], 14); volS = sma(df["volume"], 20); last = df.iloc[-1]
-    ema_bear = (e20.iloc[-1] < e50.iloc[-1] < e100.iloc[-1]) if tf_cfg.get("ema_stack_bear", True) else True
-    lowlvl = df["low"].iloc[-(tf_cfg.get("lookback_low",34)+1):-1].min()
-    breakdown = last["close"] < lowlvl; rsi_weak = r.iloc[-1] <= tf_cfg.get("rsi_max", 50)
-    vol_ok = last["volume"] > volS.iloc[-1] if tf_cfg.get("require_vol_confirm", True) and not np.isnan(volS.iloc[-1]) else True
-    if not (ema_bear and breakdown and rsi_weak and vol_ok): return None
-    invalidate = float(e20.iloc[-1])
-    return {"type":"sell_swing","note":"Breakdown (4h) with bearish EMA stack","price":float(last["close"]),
-            "invalidate_above":invalidate,"level":float(lowlvl)}
-
-def trend_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any]):
-    tf_cfg = cfg.get("trend", {})
-    if len(df) < 200: return None
-    e20, e50 = ema(df["close"],20), ema(df["close"],50)
-    r = rsi(df["close"], 14); last = df.iloc[-1]
-    cross = (e20.iloc[-1] < e50.iloc[-1] and e20.iloc[-2] >= e50.iloc[-2]) if tf_cfg.get("ema20_below_50", True) else True
-    lowlvl = df["low"].iloc[-(tf_cfg.get("lookback_low",55)+1):-1].min()
-    breakdown = last["close"] < lowlvl; rsi_weak = r.iloc[-1] <= tf_cfg.get("rsi_max", 50)
-    if not (cross and breakdown and rsi_weak): return None
-    invalidate = float(e50.iloc[-1])
-    return {"type":"sell_trend","note":"Trend shift (1d): EMA20<50 + breakdown","price":float(last["close"]),
-            "invalidate_above":invalidate,"level":float(lowlvl)}
 
 # ================== Entrypoint ==================
 if __name__ == "__main__":
