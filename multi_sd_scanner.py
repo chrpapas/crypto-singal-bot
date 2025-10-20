@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import ccxt
 
-print("=== multi_sd_scanner v2025-10-20 ===", flush=True)
+print("=== multi_sd_scanner v2025-10-20 r2 ===", flush=True)
 
 # --- helpers: parse comma-separated env/strings into list ---
 def parse_csv_env(val):
@@ -17,6 +17,16 @@ def parse_csv_env(val):
     if isinstance(val, str):
         return [s.strip() for s in val.split(",") if s.strip()]
     return []
+
+def expand_env(obj):
+    """Recursively expand ${VAR} in dicts/lists/strings using os.environ."""
+    if isinstance(obj, dict):
+        return {k: expand_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [expand_env(x) for x in obj]
+    if isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
+        return os.environ.get(obj[2:-1], obj)
+    return obj
 
 # ================== TA helpers ==================
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
@@ -98,12 +108,23 @@ def trend_exit_edge(df: pd.DataFrame, cfg: Dict[str,Any]):
 
 # ================== main run() ==================
 def run(cfg: Dict[str,Any]):
+    # Expand ${VAR} placeholders from environment first
+    cfg = expand_env(cfg)
+
     ex_names = parse_csv_env(cfg.get("exchanges") or os.environ.get("EXCHANGES","mexc"))
     watchlist = parse_csv_env(cfg.get("symbols_watchlist") or os.environ.get("SYMBOLS_WATCHLIST","BTC/USDT"))
     exits_cfg = cfg.get("exits", {"enabled": True})
 
     print("[scanner] exchanges:", ex_names, flush=True)
     print("[scanner] watchlist:", watchlist, flush=True)
+
+    # Guard: if still placeholders, explain and bail
+    if any(x.startswith("${") and x.endswith("}") for x in ex_names):
+        print("[error] EXCHANGES not set. Set env EXCHANGES (e.g. 'mexc,gate,binance') or put explicit list in config.yml.", flush=True)
+        return
+    if any(x.startswith("${") and x.endswith("}") for x in watchlist):
+        print("[error] SYMBOLS_WATCHLIST not set. Set env SYMBOLS_WATCHLIST (e.g. 'BTC/USDT,SOL/USDT') or put explicit list in config.yml.", flush=True)
+        return
 
     ex_clients = {name: ExClient(name) for name in ex_names}
 
