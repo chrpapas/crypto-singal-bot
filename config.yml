@@ -14,15 +14,15 @@ discord:
 
 # Quality / anti-noise profile
 quality:
-  profile: "safe"                  # "safe" | "balanced" | "aggressive"
+  profile: "balanced"                  # "safe" | "balanced" | "aggressive"
   min_avg_dollar_vol_1h: 200000    # liquidity floor (avg $/1h over last 24 bars)
   signal_cooldown_bars: 6          # min bars between signals for same pair/tf/type
-  require_two_closes_breakout: true
+  require_two_closes_breakout: false
   min_confidence: 70               # 0–100
 
 # DAY (1h)
 day_trade_params:
-  lookback_high: 30
+  lookback_high: 20
   vol_sma: 30
   rsi_min: 52
   rsi_max: 78
