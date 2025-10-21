@@ -1,221 +1,346 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-perf_snapshot.py — read scanner's performance from Redis and compute live stats
-- Works with the same config.yml as your multi_sd_scanner_redis.py
-- Fetches live prices via ccxt to mark open trades to market
-- Prints: win rate, avg R, profit factor, expectancy, equity curve, max drawdown, etc.
-"""
-
-import os, json, argparse, yaml, math
-from typing import Dict, Any
+import argparse, json, os, sys, math, statistics
+from typing import Dict, Any, List, Tuple
+from dataclasses import dataclass
 import pandas as pd
-import numpy as np
 import ccxt
+import yaml
 import redis
-from datetime import datetime
 
-# ---------- helpers ----------
-def load_cfg(path: str) -> Dict[str, Any]:
+# =============== Helpers ===============
+
+def safe_get_num(x, default=None):
+    """Return a float from x; if x is callable, call it; handle None/NaN."""
+    try:
+        if callable(x):
+            x = x()
+        if x is None:
+            return default
+        f = float(x)
+        if math.isnan(f):
+            return default
+        return f
+    except Exception:
+        return default
+
+def fmt_f(x, digs=6, dash='-'):
+    """Format number to fixed digs, or dash if not a number."""
+    v = safe_get_num(x, None)
+    if v is None:
+        return dash
+    try:
+        return f"{v:.{digs}f}"
+    except Exception:
+        return dash
+
+def fmt_pct(x, digs=2, dash='-'):
+    v = safe_get_num(x, None)
+    if v is None:
+        return dash
+    try:
+        return f"{v:.{digs}f}%"
+    except Exception:
+        return dash
+
+def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
+        return yaml.safe_load(f)
 
-    def expand(v):
-        if isinstance(v, dict): return {k: expand(x) for k, x in v.items()}
-        if isinstance(v, list): return [expand(x) for x in v]
-        if isinstance(v, str) and v.startswith("${") and v.endswith("}"):
-            return os.environ.get(v[2:-1], v)
-        return v
+# =============== Redis persistence ===============
 
-    return expand(cfg)
+class RedisState:
+    def __init__(self, url: str, prefix: str):
+        if not url:
+            raise RuntimeError("Redis URL missing. Provide persistence.redis_url or REDIS_URL env.")
+        self.r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=5)
+        self.prefix = prefix or "spideybot:v1"
 
-def parse_list(v):
-    if isinstance(v, list): return v
-    if isinstance(v, str): return [s.strip() for s in v.split(",") if s.strip()]
-    return []
+    def k(self, *parts) -> str:
+        return ":".join([self.prefix, *[str(p) for p in parts]])
 
-def redis_key(prefix: str, *parts: str) -> str:
-    return ":".join([prefix, *[str(p) for p in parts]])
-
-def safe_float(x, default=np.nan):
-    try: return float(x)
-    except Exception: return default
-
-# ---------- core ----------
-def compute_snapshot(cfg: Dict[str,Any]) -> None:
-    # Redis
-    p_cfg = cfg.get("persistence", {}) or {}
-    redis_url = p_cfg.get("redis_url") or os.environ.get("REDIS_URL")
-    prefix = p_cfg.get("key_prefix", "spideybot:v1")
-    if not redis_url:
-        raise RuntimeError("No Redis URL. Set persistence.redis_url or REDIS_URL")
-
-    r = redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=5)
-    perf_json = r.get(redis_key(prefix, "state", "performance"))
-    if not perf_json:
-        print("No performance state found in Redis.")
-        return
-
-    perf = json.loads(perf_json)
-    open_trades = perf.get("open_trades", [])
-    closed_trades = perf.get("closed_trades", [])
-
-    # Exchanges for marking to market
-    ex_names = parse_list(cfg.get("exchanges") or "mexc")
-    ex_map = {name: getattr(ccxt, name)({"enableRateLimit": True}) for name in ex_names}
-
-    # mark-to-market for open trades
-    mtm_rows = []
-    for tr in open_trades:
-        ex = ex_map.get(tr.get("exchange"))
-        if ex is None:
-            last = np.nan
-        else:
-            pair = tr.get("symbol")
+    def load_performance(self) -> Dict[str, Any]:
+        txt = self.r.get(self.k("state", "performance"))
+        if txt:
             try:
-                # fast path
-                t = ex.fetch_ticker(pair)
-                last = safe_float(t.get("last"))
-                if math.isnan(last):
-                    raise Exception("no last")
+                return json.loads(txt)
             except Exception:
-                # fallback to timeframe close
-                tf = tr.get("timeframe", "1h")
-                try:
-                    o = ex.fetch_ohlcv(pair, timeframe=tf, limit=1)
-                    last = float(o[-1][4])
-                except Exception:
-                    last = np.nan
+                pass
+        return {"open_trades": [], "closed_trades": []}
 
-        entry = safe_float(tr.get("entry"))
-        stop  = safe_float(tr.get("stop"))
-        risk  = max(1e-12, entry - stop)
-        r_now = (last - entry)/risk if (not math.isnan(last) and risk>0) else np.nan
-        pct_now = (last/entry - 1.0)*100.0 if (not math.isnan(last) and entry>0) else np.nan
-        mtm_rows.append({
-            "id": tr.get("id"),
-            "exchange": tr.get("exchange"),
-            "symbol": tr.get("symbol"),
-            "timeframe": tr.get("timeframe"),
-            "type": tr.get("type"),
-            "opened_at": tr.get("opened_at"),
-            "entry": entry, "stop": stop, "last": last,
-            "risk": risk, "R_unrealized": r_now, "pct_unrealized": pct_now
-        })
+    def load_active_positions(self) -> Dict[str, Any]:
+        txt = self.r.get(self.k("state", "active_positions"))
+        return json.loads(txt) if txt else {}
 
-    df_open = pd.DataFrame(mtm_rows) if mtm_rows else pd.DataFrame(columns=[
-        "id","exchange","symbol","timeframe","type","opened_at",
-        "entry","stop","last","risk","R_unrealized","pct_unrealized"
-    ])
-    df_closed = pd.DataFrame(closed_trades) if closed_trades else pd.DataFrame(columns=[
-        "id","exchange","symbol","timeframe","type","opened_at","closed_at",
-        "entry","stop","exit_price","outcome","r_multiple","pct_return","reason"
-    ])
+# =============== CCXT wrapper ===============
 
-    # Clean types
-    if not df_closed.empty:
-        if "r_multiple" not in df_closed:
-            df_closed["risk"] = (df_closed["entry"] - df_closed["stop"]).clip(lower=1e-12)
-            df_closed["r_multiple"] = (df_closed["exit_price"] - df_closed["entry"]) / df_closed["risk"]
-        df_closed["r_multiple"] = pd.to_numeric(df_closed["r_multiple"], errors="coerce")
-        if "closed_at" in df_closed:
-            df_closed["closed_at"] = pd.to_datetime(df_closed["closed_at"], errors="coerce", utc=True)
+class ExClient:
+    def __init__(self, name: str):
+        self.name = name
+        self.ex = getattr(ccxt, name)({"enableRateLimit": True})
+        self._markets = None
 
-    # -------- metrics on closed --------
-    def profit_factor(r):
-        pos = r[r>0].sum()
-        neg = -r[r<0].sum()
-        return (pos/neg) if neg>0 else np.inf if pos>0 else 0.0
+    def load_markets(self):
+        if self._markets is None:
+            try:
+                self._markets = self.ex.load_markets()
+            except Exception:
+                self._markets = {}
+        return self._markets
 
-    if df_closed.empty:
-        win_rate = avg_R = exp_R = pf = med_R = best_R = worst_R = 0.0
-        trades_n = 0
-    else:
-        R = df_closed["r_multiple"].dropna()
-        trades_n = len(R)
-        win_rate = (R>0).mean()*100.0
-        avg_R = R.mean()
-        med_R = R.median()
-        best_R = R.max()
-        worst_R = R.min()
-        pf = profit_factor(R)
-        exp_R = avg_R
+    def has_pair(self, symbol_pair: str) -> bool:
+        mkts = self.load_markets() or {}
+        if symbol_pair in mkts: return True
+        syms = getattr(self.ex, "symbols", None) or []
+        return symbol_pair in syms
 
-    # -------- equity curve + max drawdown (in R) --------
-    def max_drawdown(series):
-        if series.empty: return 0.0
-        cummax = series.cummax()
-        dd = series - cummax
-        return float(dd.min())
+    def last_close(self, symbol: str, tf: str) -> float:
+        # Fetch last 2 candles and use the latest close
+        rows = self.ex.fetch_ohlcv(symbol, timeframe=tf, limit=2)
+        if not rows:
+            raise RuntimeError(f"No OHLCV for {self.name} {symbol} {tf}")
+        return float(rows[-1][4])
 
-    equity_R = pd.Series(dtype=float)
-    if not df_closed.empty:
-        dfc = df_closed.sort_values("closed_at")
-        equity_R = dfc["r_multiple"].fillna(0).cumsum()
+# =============== Dataclasses for reporting ===============
 
-    unreal_R = float(df_open["R_unrealized"].dropna().sum()) if not df_open.empty else 0.0
-    eq_with_open = equity_R.copy()
-    if not eq_with_open.empty:
-        eq_with_open.iloc[-1] = eq_with_open.iloc[-1] + unreal_R
-    else:
-        eq_with_open = pd.Series([unreal_R])
+@dataclass
+class ClosedStats:
+    n: int
+    win_rate: float
+    avg_r: float
+    med_r: float
+    best_r: float
+    worst_r: float
+    profit_factor: float
+    total_r: float
 
-    mdd_R_closed_only = max_drawdown(equity_R) if not equity_R.empty else 0.0
-    mdd_R_with_open   = max_drawdown(eq_with_open) if not eq_with_open.empty else 0.0
+@dataclass
+class OpenMTM:
+    exchange: str
+    symbol: str
+    timeframe: str
+    entry: float
+    stop: float
+    last: float
+    risk: float
+    R_unrealized: float
+    pct_unrealized: float
 
-    # -------- breakdowns --------
-    by_tf = None
-    if not df_closed.empty:
-        by = df_closed.groupby("timeframe")["r_multiple"]
-        by_tf = by.agg(trades="count", win_rate=lambda s: (s>0).mean()*100.0,
-                       avg_R="mean", pf=lambda s: profit_factor(s)).reset_index()
+# =============== Core calculators ===============
 
-    # -------- print --------
+def compute_closed_stats(closed: List[Dict[str, Any]]) -> ClosedStats:
+    if not closed:
+        return ClosedStats(0, 0.0, 0.0, 0.0, 0.0, 0.0, float('nan'), 0.0)
+
+    R_vals = []
+    for tr in closed:
+        r = safe_get_num(tr.get("r_multiple"), 0.0)
+        R_vals.append(r)
+
+    n = len(R_vals)
+    wins = [r for r in R_vals if r > 0]
+    losses = [r for r in R_vals if r < 0]
+
+    win_rate = 100.0 * (len(wins) / n) if n else 0.0
+    avg_r = statistics.mean(R_vals) if R_vals else 0.0
+    med_r = statistics.median(R_vals) if R_vals else 0.0
+    best_r = max(R_vals) if R_vals else 0.0
+    worst_r = min(R_vals) if R_vals else 0.0
+    gain = sum(wins) if wins else 0.0
+    loss = -sum(losses) if losses else 0.0
+    profit_factor = float('inf') if loss == 0 and gain > 0 else (gain / loss if loss > 0 else 0.0)
+    total_r = sum(R_vals)
+
+    return ClosedStats(
+        n=n,
+        win_rate=win_rate,
+        avg_r=avg_r,
+        med_r=med_r,
+        best_r=best_r,
+        worst_r=worst_r,
+        profit_factor=profit_factor,
+        total_r=total_r
+    )
+
+def group_by_timeframe(closed: List[Dict[str, Any]]) -> Dict[str, ClosedStats]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for tr in closed:
+        tf = tr.get("timeframe") or "?"
+        buckets.setdefault(tf, []).append(tr)
+    out = {}
+    for tf, arr in buckets.items():
+        out[tf] = compute_closed_stats(arr)
+    return out
+
+def rolling_equity_R(R_vals: List[float]) -> Tuple[List[float], float]:
+    """Return rolling equity curve and max drawdown (R)."""
+    eq = []
+    s = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in R_vals:
+        s += r
+        eq.append(s)
+        peak = max(peak, s)
+        dd = s - peak
+        if dd < max_dd:
+            max_dd = dd
+    return eq, max_dd
+
+# =============== Snapshot computation ===============
+
+def compute_snapshot(cfg: Dict[str, Any]):
+    # Redis config
+    p = cfg.get("persistence", {})
+    redis_url = p.get("redis_url") or os.environ.get("REDIS_URL")
+    key_prefix = p.get("key_prefix", "spideybot:v1")
+
+    # Optional risk → money conversion
+    risk_per_trade_usd = None
+    if cfg.get("__cli_risk_per_trade_usd__") is not None:
+        risk_per_trade_usd = float(cfg["__cli_risk_per_trade_usd__"])
+
+    rs = RedisState(redis_url, key_prefix)
+    perf = rs.load_performance()
+
+    closed = perf.get("closed_trades", []) or []
+    open_trs = perf.get("open_trades", []) or []
+
     print("=== Performance Snapshot ===")
-    print(f"As of: {datetime.utcnow().isoformat()}Z")
-    print(f"Redis prefix: {prefix}")
-    print("")
+    print(f"As of: {pd.Timestamp.utcnow().isoformat()}Z")
+    print(f"Redis prefix: {key_prefix}")
+    print()
+
+    # ----- Closed trades -----
     print("--- Closed trades ---")
-    print(f"Closed trades: {trades_n}")
-    print(f"Win rate:      {win_rate:.1f}%")
-    print(f"Avg R:         {avg_R:.3f}   | Median R: {med_R:.3f}")
-    print(f"Best/Worst R:  {best_R:.2f} / {worst_R:.2f}")
-    print(f"Profit factor: {pf:.2f}")
-    print("")
+    cs = compute_closed_stats(closed)
+    print(f"Closed trades: {cs.n}")
+    print(f"Win rate:      {cs.win_rate:.1f}%")
+    print(f"Avg R:         {cs.avg_r:.3f}   | Median R: {cs.med_r:.3f}")
+    print(f"Best/Worst R:  {cs.best_r:.2f} / {cs.worst_r:.2f}")
+    pf_txt = "inf" if math.isinf(cs.profit_factor) else f"{cs.profit_factor:.2f}"
+    print(f"Profit factor: {pf_txt}")
+    print()
+
+    # ----- Open trades MTM -----
     print("--- Open trades (MTM) ---")
-    print(f"Open trades:   {len(df_open)}")
-    print(f"Unrealized R:  {unreal_R:.3f}")
-    print("")
+    # Build exchange clients that are actually needed
+    ex_names_needed = sorted(set([t.get("exchange") for t in open_trs if t.get("exchange")]))
+    ex_clients: Dict[str, ExClient] = {}
+    for ex_name in ex_names_needed:
+        try:
+            ex_clients[ex_name] = ExClient(ex_name)
+        except Exception as e:
+            print(f"[ex] {ex_name} init err:", e)
+
+    open_mtm: List[OpenMTM] = []
+    for tr in open_trs:
+        if tr.get("status") != "open":
+            continue
+        ex_name = tr.get("exchange")
+        sym = tr.get("symbol")
+        tf = tr.get("timeframe") or "1h"
+        entry = safe_get_num(tr.get("entry"), None)
+        stop = safe_get_num(tr.get("stop"), None)
+        risk = safe_get_num(tr.get("risk"), None)
+
+        if ex_name not in ex_clients or entry is None or stop is None or risk is None or risk <= 0:
+            # Skip malformed trade
+            continue
+        try:
+            last = ex_clients[ex_name].last_close(sym, tf)
+        except Exception as e:
+            # If fetch fails, skip this trade (or use entry as proxy)
+            last = entry
+
+        R_unreal = (last - entry) / max(risk, 1e-12)
+        pct_unreal = (last / entry - 1.0) * 100.0 if entry else 0.0
+        open_mtm.append(OpenMTM(
+            exchange=ex_name, symbol=sym, timeframe=tf,
+            entry=float(entry), stop=float(stop), last=float(last),
+            risk=float(risk), R_unrealized=float(R_unreal),
+            pct_unrealized=float(pct_unreal)
+        ))
+
+    unreal_R_total = sum([t.R_unrealized for t in open_mtm]) if open_mtm else 0.0
+    print(f"Open trades:   {len(open_mtm)}")
+    print(f"Unrealized R:  {unreal_R_total:.3f}")
+    if risk_per_trade_usd is not None:
+        print(f"Unrealized P/L: ${unreal_R_total * risk_per_trade_usd:.2f} (assumes ${risk_per_trade_usd:.2f} risk/trade)")
+    print()
+
+    # ----- Equity curves in R -----
     print("--- Equity (R) ---")
-    latest_eq_closed = float(equity_R.iloc[-1]) if not equity_R.empty else 0.0
-    latest_eq_with_open = float(eq_with_open.iloc[-1]) if not eq_with_open.empty else 0.0
-    print(f"Equity (closed only): {latest_eq_closed:.2f} R | Max DD: {mdd_R_closed_only:.2f} R")
-    print(f"Equity (+open MTM):   {latest_eq_with_open:.2f} R | Max DD: {mdd_R_with_open:.2f} R")
-    print("")
+    closed_R = [safe_get_num(t.get("r_multiple"), 0.0) for t in closed]
+    eq_closed, max_dd_closed = rolling_equity_R(closed_R)
+    total_closed = eq_closed[-1] if eq_closed else 0.0
+    print(f"Equity (closed only): {total_closed:.2f} R | Max DD: {max_dd_closed:.2f} R")
 
-    if by_tf is not None and not by_tf.empty:
-        print("--- By timeframe ---")
-        for _, row in by_tf.iterrows():
-            print(f"{row['timeframe']:>3}: n={int(row['trades'])} | win {row['win_rate']:.1f}% | avgR {row['avg_R']:.3f} | PF {row['pf']:.2f}")
-        print("")
+    eq_plus_open = total_closed + unreal_R_total
+    # A conservative open-DD proxy: min(0, unreal_R_total)
+    max_dd_plus_open = min(max_dd_closed, max_dd_closed + unreal_R_total)
+    print(f"Equity (+open MTM):   {eq_plus_open:.2f} R | Max DD: {max_dd_plus_open:.2f} R")
 
-    # optional: list open trades snapshot
-    if not df_open.empty:
+    if risk_per_trade_usd is not None:
+        print(f"Equity (closed): ${total_closed * risk_per_trade_usd:.2f}")
+        print(f"Equity (+open):  ${eq_plus_open * risk_per_trade_usd:.2f}")
+    print()
+
+    # ----- Breakdown by timeframe -----
+    print("--- By timeframe ---")
+    by_tf = group_by_timeframe(closed)
+    for tf, st in sorted(by_tf.items()):
+        pf_txt = "inf" if math.isinf(st.profit_factor) else f"{st.profit_factor:.2f}"
+        print(f" {tf}: n={st.n} | win {st.win_rate:.1f}% | avgR {st.avg_r:.3f} | PF {pf_txt}")
+    print()
+
+    # ----- Open trades detail -----
+    if open_mtm:
         print("--- Open trades detail (top 10 by |R|) ---")
-        dfo = df_open.copy()
-        dfo["absR"] = dfo["R_unrealized"].abs()
-        view = dfo.sort_values("absR", ascending=False).head(10)[
-            ["exchange", "symbol", "timeframe", "R_unrealized", "pct_unrealized", "entry", "last", "opened_at"]
-        ]
-        for _, r in view.iterrows():
-            print(f"[{r['exchange']}] {r['symbol']} {r['timeframe']} | "
-                  f"R={r['R_unrealized']:.2f} | {r['pct_unrealized']:.2f}% | "
-                  f"entry={r['entry']:.6f} last={r['last']:.6f}")
+        top = sorted(open_mtm, key=lambda t: abs(t.R_unrealized), reverse=True)[:10]
+        for r in top:
+            print(
+                f"[{r.exchange}] {r.symbol} {r.timeframe} | "
+                f"R={fmt_f(r.R_unrealized,2)} | {fmt_f(r.pct_unrealized,2)}% | "
+                f"entry={fmt_f(r.entry,6)} last={fmt_f(r.last,6)}"
+            )
+        print()
+
+    # ----- Totals in money (optional) -----
+    if risk_per_trade_usd is not None:
+        total_money_closed = total_closed * risk_per_trade_usd
+        total_money_open = unreal_R_total * risk_per_trade_usd
+        print("--- Money P/L (assumed) ---")
+        print(f"Closed P/L:  ${total_money_closed:.2f}")
+        print(f"Open P/L:    ${total_money_open:.2f}")
+        print(f"Net P/L:     ${total_money_closed + total_money_open:.2f}")
+
+# =============== Entrypoint ===============
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yml")
+    ap.add_argument("--risk_per_trade_usd", type=float, default=None,
+                    help="If set, also show money P/L by multiplying R with this per-trade risk (e.g., 100).")
     args = ap.parse_args()
-    cfg = load_cfg(args.config)
-    compute_snapshot(cfg)
+
+    cfg = load_yaml(args.config)
+
+    # expand ${VAR}
+    def expand_env(obj):
+        if isinstance(obj, dict): return {k: expand_env(v) for k, v in obj.items()}
+        if isinstance(obj, list): return [expand_env(x) for x in obj]
+        if isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
+            return os.environ.get(obj[2:-1], obj)
+        return obj
+
+    cfg = expand_env(cfg)
+    if args.risk_per_trade_usd is not None:
+        cfg["__cli_risk_per_trade_usd__"] = args.risk_per_trade_usd
+
+    try:
+        compute_snapshot(cfg)
+    except Exception as e:
+        print("Snapshot failed:", e)
+        sys.exit(1)
