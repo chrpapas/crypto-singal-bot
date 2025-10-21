@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+perf_snapshot.py — read scanner's performance from Redis and compute live stats
+- Works with the same config.yml as your multi_sd_scanner_redis.py
+- Fetches live prices via ccxt to mark open trades to market
+- Prints: win rate, avg R, profit factor, expectancy, equity curve, max drawdown, etc.
+"""
+
 import os, json, argparse, yaml, math
 from typing import Dict, Any
 import pandas as pd
@@ -61,11 +68,11 @@ def compute_snapshot(cfg: Dict[str,Any]) -> None:
     # mark-to-market for open trades
     mtm_rows = []
     for tr in open_trades:
-        ex = ex_map.get(tr["exchange"])
+        ex = ex_map.get(tr.get("exchange"))
         if ex is None:
             last = np.nan
         else:
-            pair = tr["symbol"]
+            pair = tr.get("symbol")
             try:
                 # fast path
                 t = ex.fetch_ticker(pair)
@@ -81,8 +88,8 @@ def compute_snapshot(cfg: Dict[str,Any]) -> None:
                 except Exception:
                     last = np.nan
 
-        entry = safe_float(tr["entry"])
-        stop  = safe_float(tr["stop"])
+        entry = safe_float(tr.get("entry"))
+        stop  = safe_float(tr.get("stop"))
         risk  = max(1e-12, entry - stop)
         r_now = (last - entry)/risk if (not math.isnan(last) and risk>0) else np.nan
         pct_now = (last/entry - 1.0)*100.0 if (not math.isnan(last) and entry>0) else np.nan
@@ -109,7 +116,6 @@ def compute_snapshot(cfg: Dict[str,Any]) -> None:
     # Clean types
     if not df_closed.empty:
         if "r_multiple" not in df_closed:
-            # derive if possible
             df_closed["risk"] = (df_closed["entry"] - df_closed["stop"]).clip(lower=1e-12)
             df_closed["r_multiple"] = (df_closed["exit_price"] - df_closed["entry"]) / df_closed["risk"]
         df_closed["r_multiple"] = pd.to_numeric(df_closed["r_multiple"], errors="coerce")
@@ -134,7 +140,7 @@ def compute_snapshot(cfg: Dict[str,Any]) -> None:
         best_R = R.max()
         worst_R = R.min()
         pf = profit_factor(R)
-        exp_R = avg_R  # expectancy per trade in R
+        exp_R = avg_R
 
     # -------- equity curve + max drawdown (in R) --------
     def max_drawdown(series):
@@ -148,13 +154,11 @@ def compute_snapshot(cfg: Dict[str,Any]) -> None:
         dfc = df_closed.sort_values("closed_at")
         equity_R = dfc["r_multiple"].fillna(0).cumsum()
 
-    # include open R unrealized (sum) as current mark
     unreal_R = float(df_open["R_unrealized"].dropna().sum()) if not df_open.empty else 0.0
     eq_with_open = equity_R.copy()
     if not eq_with_open.empty:
         eq_with_open.iloc[-1] = eq_with_open.iloc[-1] + unreal_R
     else:
-        # no closed trades yet; equity is just unrealized
         eq_with_open = pd.Series([unreal_R])
 
     mdd_R_closed_only = max_drawdown(equity_R) if not equity_R.empty else 0.0
@@ -202,10 +206,12 @@ def compute_snapshot(cfg: Dict[str,Any]) -> None:
         dfo = df_open.copy()
         dfo["absR"] = dfo["R_unrealized"].abs()
         view = dfo.sort_values("absR", ascending=False).head(10)[
-            ["exchange","symbol","timeframe","R_unrealized","pct_unrealized","entry","last","opened_at"]
+            ["exchange", "symbol", "timeframe", "R_unrealized", "pct_unrealized", "entry", "last", "opened_at"]
         ]
         for _, r in view.iterrows():
-            print(f"[{r.exchange}] {r.symbol} {r.timeframe} | R={r.R_unrealized:.2f} | {r.pct_unrealized:.2f}% | entry={r.entry:.6f} last={r.last:.6f}")
+            print(f"[{r['exchange']}] {r['symbol']} {r['timeframe']} | "
+                  f"R={r['R_unrealized']:.2f} | {r['pct_unrealized']:.2f}% | "
+                  f"entry={r['entry']:.6f} last={r['last']:.6f}")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
