@@ -18,7 +18,7 @@ symbols_watchlist:
 # Day trade parameters
 # ===============================
 day_trade_params:
-  lookback_high: 30
+  lookback_high: 20
   vol_sma: 30
   rsi_min: 52
   rsi_max: 78
@@ -155,7 +155,7 @@ persistence:
 quality:
   signal_cooldown_bars: 6
   min_avg_dollar_vol_1h: 200000
-  require_two_closes_breakout: true
+  require_two_closes_breakout: false
   min_confidence: 70
 
 # ===============================
