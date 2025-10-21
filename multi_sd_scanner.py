@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json, os, yaml, requests
+import argparse, json, os, yaml, requests, sys
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Tuple, Set
 import pandas as pd
 import numpy as np
 import ccxt
+import redis
 
 # ================== TA helpers ==================
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
@@ -70,6 +71,76 @@ class TrendParams:
     breakout_lookback: int = 55
     stop_mode: str = "swing"
     atr_mult: float = 2.0
+
+# ================== Persistence (Redis-only) ==================
+class RedisState:
+    """
+    Keys used:
+      {prefix}:state:active_positions      -> JSON
+      {prefix}:state:performance           -> JSON
+      {prefix}:perf:closed_csv             -> CSV text (optional)
+      {prefix}:mem:entry_edge:{key}        -> ISO bar timestamp (TTL)
+      {prefix}:mem:exit_edge:{key}         -> ISO bar timestamp (TTL)
+    """
+    def __init__(self, url: str, prefix: str, ttl_minutes: int):
+        if not url:
+            raise RuntimeError("Redis URL missing. Set persistence.redis_url or REDIS_URL.")
+        self.url = url
+        self.prefix = prefix or "spideybot:v1"
+        self.ttl_seconds = int(ttl_minutes) * 60 if ttl_minutes else 48*3600
+        self.r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=5)
+        # self-test + banner
+        try:
+            self.r.setex(self.k("selftest"), self.ttl_seconds, pd.Timestamp.utcnow().isoformat())
+            print(f"[persistence] Redis connected @ {url}")
+            print(f"[persistence] key_prefix={self.prefix}  edge-ttl-min={self.ttl_seconds//60}")
+        except Exception as e:
+            print("[persistence] Redis connection failed:", e)
+            raise
+
+    def k(self, *parts) -> str:
+        return ":".join([self.prefix, *[str(p) for p in parts]])
+
+    # ---- entry/exit de-dup memories (edge-trigger) ----
+    def get_entry_mem(self, key: str) -> str:
+        return self.r.get(self.k("mem", "entry_edge", key)) or ""
+    def set_entry_mem(self, key: str, bar_iso: str):
+        self.r.setex(self.k("mem", "entry_edge", key), self.ttl_seconds, bar_iso)
+
+    def get_exit_mem(self, key: str) -> str:
+        return self.r.get(self.k("mem", "exit_edge", key)) or ""
+    def set_exit_mem(self, key: str, bar_iso: str):
+        self.r.setex(self.k("mem", "exit_edge", key), self.ttl_seconds, bar_iso)
+
+    # ---- positions ----
+    def load_positions(self) -> Dict[str, Any]:
+        txt = self.r.get(self.k("state", "active_positions"))
+        return json.loads(txt) if txt else {}
+    def save_positions(self, positions: Dict[str, Any]):
+        self.r.set(self.k("state", "active_positions"), json.dumps(positions))
+
+    # ---- performance ----
+    def load_performance(self) -> Dict[str, Any]:
+        txt = self.r.get(self.k("state", "performance"))
+        if txt:
+            try: return json.loads(txt)
+            except Exception: ...
+        return {"open_trades": [], "closed_trades": []}
+    def save_performance(self, perf: Dict[str, Any]):
+        self.r.set(self.k("state", "performance"), json.dumps(perf))
+
+    def store_closed_csv(self, csv_text: str):
+        self.r.set(self.k("perf", "closed_csv"), csv_text)
+
+# Global handle
+RDS: RedisState = None
+
+def rds_from_cfg(cfg: Dict[str, Any]) -> RedisState:
+    p = cfg.get("persistence", {}) or {}
+    url = p.get("redis_url") or os.environ.get("REDIS_URL")
+    prefix = p.get("key_prefix", "spideybot:v1")
+    ttl_minutes = int(p.get("ttl_minutes", 2880))  # 2 days
+    return RedisState(url=url, prefix=prefix, ttl_minutes=ttl_minutes)
 
 # ================== SD zones ==================
 def body(df: pd.DataFrame) -> pd.Series: return (df['close'] - df['open']).abs()
@@ -143,8 +214,8 @@ def day_early_reversal_signal(df: pd.DataFrame, p_map: Dict[str,Any], sd_cfg: Di
     rsi_ok = r.iloc[-1] >= er.get("min_rsi", 55)
     ext = abs((last_close - e20.iloc[-1]) / (e20.iloc[-1] + 1e-9) * 100.0); not_extended = ext <= er.get("max_extension_pct", 6)
     vol_ok = last_vol >= er.get("min_vol_mult", 1.0) * (volS.iloc[-1] if not np.isnan(volS.iloc[-1]) else last_vol)
-    ok = ema_cross and macd_ok and rsi_ok and not_extended and vol_ok
-    if not ok: return None
+    ok = ema_cross, macd_ok, rsi_ok, not_extended, vol_ok
+    if not all(ok): return None
     if sd_cfg.get("enabled") and sd_cfg.get("mode","prefer") == "require" and not in_demand(float(last_close), zones): return None
 
     entry = float(last_close); stop  = stop_from(df, p_map.get("stop_mode","swing"), p_map.get("atr_mult",1.5))
@@ -232,16 +303,17 @@ def filter_pairs_on_exchanges(ex_clients: Dict[str,ExClient], symbols: List[str]
     return by_ex
 
 # ================== State (positions, entry/exit memory, performance) ==================
-def load_state(path:str)->Dict[str,Any]:
-    try:
-        if os.path.exists(path):
-            with open(path,"r") as f: return json.load(f)
-    except Exception as e: print("[state] load err:", e)
-    return {"active_positions":{}}
-def save_state(path:str, state:Dict[str,Any]):
-    try:
-        with open(path,"w") as f: json.dump(state,f)
-    except Exception as e: print("[state] save err:", e)
+def load_state(_:str)->Dict[str,Any]:
+    """Load from Redis into the in-memory structure."""
+    ap = RDS.load_positions()
+    pf = RDS.load_performance()
+    return {"active_positions": ap, "performance": pf}
+
+def save_state(_:str, state:Dict[str,Any]):
+    """Persist positions & performance back to Redis."""
+    RDS.save_positions(state.get("active_positions", {}))
+    RDS.save_performance(state.get("performance", {"open_trades": [], "closed_trades": []}))
+
 def pos_key(exchange:str, pair:str, sig_type:str)->str: return f"{exchange}|{pair}|{sig_type}"
 def update_state_with_entries(state:Dict[str,Any], signals:List[Dict[str,Any]]):
     ap = state.setdefault("active_positions",{})
@@ -254,21 +326,11 @@ def remove_position(state:Dict[str,Any], exchange:str, pair:str, sig_type:str):
     ap = state.setdefault("active_positions",{})
     ap.pop(pos_key(exchange,pair,sig_type), None)
 
-# exit memory
-def get_exit_memory(state: Dict[str,Any], key: str) -> str:
-    mem = state.setdefault("exit_memory", {})
-    return mem.get(key, "")
-def set_exit_memory(state: Dict[str,Any], key: str, bar_iso: str):
-    mem = state.setdefault("exit_memory", {})
-    mem[key] = bar_iso
-
-# entry memory
-def get_entry_memory(state: Dict[str,Any], key: str) -> str:
-    mem = state.setdefault("entry_memory", {})
-    return mem.get(key, "")
-def set_entry_memory(state: Dict[str,Any], key: str, bar_iso: str):
-    mem = state.setdefault("entry_memory", {})
-    mem[key] = bar_iso
+# edge memories (Redis TTL)
+def get_exit_memory(_: Dict[str,Any], key: str) -> str: return RDS.get_exit_mem(key)
+def set_exit_memory(_: Dict[str,Any], key: str, bar_iso: str): RDS.set_exit_mem(key, bar_iso)
+def get_entry_memory(_: Dict[str,Any], key: str) -> str: return RDS.get_entry_mem(key)
+def set_entry_memory(_: Dict[str,Any], key: str, bar_iso: str): RDS.set_entry_mem(key, bar_iso)
 
 # ================== Performance tracking ==================
 def perf_state(state: Dict[str,Any]) -> Dict[str,Any]:
@@ -284,7 +346,7 @@ def add_open_trade(state, *, exchange, symbol, tf, sig_type, entry, stop, t1, t2
         "exchange": exchange,
         "symbol": symbol,
         "timeframe": tf,
-        "type": sig_type,           # day/swing/trend
+        "type": sig_type,
         "opened_at": event_ts,
         "entry": float(entry),
         "stop": float(stop),
@@ -297,19 +359,22 @@ def close_trade(tr, *, outcome, price, closed_at, reason):
     tr["status"] = "closed"
     tr["closed_at"] = str(closed_at)
     tr["exit_price"] = float(price)
-    tr["outcome"] = outcome  # "stop", "t1", "t2", "exit_signal", "timeout"
+    tr["outcome"] = outcome
     rr = (price - tr["entry"]) / max(1e-12, tr["risk"])
     tr["r_multiple"] = float(rr)
     tr["pct_return"] = float((price/tr["entry"] - 1) * 100.0)
     tr["reason"] = reason
-def write_perf_csv(state, path: str):
+def write_perf_csv(state, _path_ignored: str):
+    """Store closed trades CSV in Redis instead of file."""
     try:
         closed = perf_state(state)["closed_trades"]
         if not closed: return
         df = pd.DataFrame(closed)
-        df.to_csv(path, index=False)
+        csv_text = df.to_csv(index=False)
+        RDS.store_closed_csv(csv_text)
+        print("[perf] closed trades CSV stored in Redis key:", RDS.k("perf", "closed_csv"))
     except Exception as e:
-        print("[perf] csv write err:", e)
+        print("[perf] csv store err:", e)
 
 def _eval_hit_order(rows, entry, stop, t1, t2, *, tp_priority="target_first"):
     for r in rows:
@@ -410,10 +475,6 @@ def parse_csv_env(val):
     return []
 
 # ======== Merge helpers (FUZZY merge identical setups across exchanges) ========
-def _roundf(x, n=6):
-    try: return float(round(float(x), n))
-    except Exception: return None
-
 def _approx_equal(a: float, b: float, tol_pct: float = 0.005, tol_abs: float = None) -> bool:
     try:
         a = float(a); b = float(b)
@@ -425,11 +486,6 @@ def _approx_equal(a: float, b: float, tol_pct: float = 0.005, tol_abs: float = N
     return abs(a - b) / denom <= tol_pct
 
 def merge_entries_fuzzy(signals: list, tol_pct: float = 0.005, tol_abs: float = None) -> list:
-    """
-    Group entries across exchanges if they are 'the same setup':
-    same (type, symbol, timeframe, note) and prices within tolerance.
-    Returns collapsed groups with entry/stop/t1/t2 ranges and exchange list.
-    """
     groups = []
     for s in signals or []:
         base = (s.get("type"), s.get("symbol"), s.get("timeframe"), s.get("note",""))
@@ -501,7 +557,6 @@ def _macd_bear(df):
     line, sig, _ = macd(df["close"])
     return line.iloc[-1] < sig.iloc[-1], (line.iloc[-2] >= sig.iloc[-2]) and (line.iloc[-1] < sig.iloc[-1])
 
-# ---- Day (1h) ----
 def day_exit_edge(df: pd.DataFrame, cfg: Dict[str,Any]):
     if df is None or len(df) < 60: return False, "", None
     p_ema = int(cfg.get("ema_break", 20))
@@ -513,7 +568,6 @@ def day_exit_edge(df: pd.DataFrame, cfg: Dict[str,Any]):
     r = rsi(df["close"], 14)
     close_now, close_prev = df["close"].iloc[-1], df["close"].iloc[-2]
     e_now, e_prev = e.iloc[-1], e.iloc[-2]
-
     cross_down = (close_prev >= e_prev) and (close_now < e_now)
     if not cross_down:
         return False, "", df.index[-1]
@@ -532,31 +586,25 @@ def day_exit(df: pd.DataFrame, cfg: Dict[str,Any]):
     p_ema = int(cfg.get("ema_break", 20))
     p_to   = int(cfg.get("rsi_drop_to", 60))
     macd_need = bool(cfg.get("macd_confirm", True))
-
     e = _ema(df["close"], p_ema)
     r = rsi(df["close"], 14)
     macd_bear, macd_cross = _macd_bear(df)
-
     if (df["close"].iloc[-1] < e.iloc[-1]) and ((r.iloc[-1] <= p_to) or (macd_cross if macd_need else macd_bear)):
         return True, f"Close<EMA{p_ema} & momentum roll-over"
     return False, ""
 
-# ---- Swing (4h) ----
 def swing_exit_edge(df: pd.DataFrame, cfg: Dict[str,Any]):
     if df is None or len(df) < 120: return False, "", None
     p_ema = int(cfg.get("ema_break", 50))
     rsi_below = int(cfg.get("rsi_below", 50))
     macd_need = bool(cfg.get("macd_confirm", True))
-
     e = _ema(df["close"], p_ema)
     r = rsi(df["close"], 14)
     close_now, close_prev = df["close"].iloc[-1], df["close"].iloc[-2]
     e_now, e_prev = e.iloc[-1], e.iloc[-2]
     cross_down = (close_prev >= e_prev) and (close_now < e_now)
-
     macd_bear, macd_cross = _macd_bear(df)
     macd_ok = macd_cross if macd_need else macd_bear
-
     if cross_down and (r.iloc[-1] <= rsi_below or macd_ok):
         why = f"EMA{p_ema} cross-down; " + ("RSI<=%d" % rsi_below if r.iloc[-1] <= rsi_below else "MACD bear")
         return True, why, df.index[-1]
@@ -572,19 +620,16 @@ def swing_exit(df: pd.DataFrame, cfg: Dict[str,Any]):
         return True, f"Close<EMA{p_ema} & momentum roll-over"
     return False, ""
 
-# ---- Trend (1d) ----
 def trend_exit_edge(df: pd.DataFrame, cfg: Dict[str,Any]):
     if df is None or len(df) < 200: return False, "", None
     need_cross = bool(cfg.get("ema_cross_20_50", True))
     rsi_below = int(cfg.get("rsi_below", 50))
     macd_need = bool(cfg.get("macd_confirm", True))
-
     e20, e50 = _ema(df["close"],20), _ema(df["close"],50)
     cross20_50 = (e20.iloc[-2] >= e50.iloc[-2]) and (e20.iloc[-1] < e50.iloc[-1]) if need_cross else True
     r = rsi(df["close"], 14)
     macd_bear, macd_cross = _macd_bear(df)
     macd_ok = macd_cross if macd_need else macd_bear
-
     if cross20_50 and (r.iloc[-1] <= rsi_below or macd_ok):
         why = ("EMA20<EMA50 cross; " if need_cross else "") + ("RSI<=%d" % rsi_below if r.iloc[-1] <= rsi_below else "MACD bear")
         return True, why, df.index[-1]
@@ -681,8 +726,9 @@ def run(cfg: Dict[str,Any]):
     bearish_cfg = cfg.get("bearish_signals", {"enabled": False})
     qcfg = cfg.get("quality", {})
     pfcfg = cfg.get("performance", {})
-    state_path = exits_cfg.get("state_file","state.json")
-    state = load_state(state_path)
+
+    # ---- Load state from Redis ----
+    state = load_state("ignored")
 
     # movers
     movers_pairs_by_ex = {name: [] for name in ex_clients.keys()}
@@ -755,7 +801,7 @@ def run(cfg: Dict[str,Any]):
                         sig["confidence"] = conf
                         if conf < qcfg.get("min_confidence", 70): sig = None
 
-                # Edge-trigger dedup (entries)
+                # Edge-trigger dedup (entries) via Redis TTL memory
                 if sig and allow_day and qcfg.get("edge_entries", True):
                     evts = sig.get("event_bar_ts") or df1h.index[-1].isoformat()
                     k = f"{ex_name}|{pair}|1h|{sig['type']}|{sig.get('note','')}"
@@ -772,7 +818,6 @@ def run(cfg: Dict[str,Any]):
                                        sig_type="day", entry=sig["entry"], stop=sig["stop"],
                                        t1=sig.get("t1"), t2=sig.get("t2"),
                                        event_ts=sig.get("event_bar_ts", pd.Timestamp.utcnow().isoformat()))
-
             except Exception as e: print(f"[scan-day] {ex_name} {pair} err:", e)
 
         # SWING (4h)
@@ -806,7 +851,6 @@ def run(cfg: Dict[str,Any]):
                                        sig_type="swing", entry=sig["entry"], stop=sig["stop"],
                                        t1=sig.get("t1"), t2=sig.get("t2"),
                                        event_ts=df4h.index[-1].isoformat())
-
             except Exception as e: print(f"[scan-swing] {ex_name} {pair} err:", e)
 
         # TREND (1d)
@@ -839,10 +883,9 @@ def run(cfg: Dict[str,Any]):
                                        sig_type="trend", entry=sig["entry"], stop=sig["stop"],
                                        t1=sig.get("t1"), t2=sig.get("t2"),
                                        event_ts=dfd.index[-1].isoformat())
-
             except Exception as e: print(f"[scan-trend] {ex_name} {pair} err:", e)
 
-    # remember entries in position state
+    # remember entries in position state + persist
     update_state_with_entries(state, results["signals"])
 
     # ===== exits (edge-trigger) =====
@@ -932,7 +975,6 @@ def run(cfg: Dict[str,Any]):
                                         close_trade(tr, outcome="exit_signal", price=px, closed_at=dfd.index[-1], reason="trend_exit")
                                         perf_state(state)["closed_trades"].append(tr)
                                 ps["open_trades"] = [t for t in ps["open_trades"] if t.get("status")=="open"]
-
                 except Exception as e: print(f"[exits] {ex_name} {pair} err:", e)
 
     # ===== bearish setups (sell alerts) =====
@@ -988,8 +1030,8 @@ def run(cfg: Dict[str,Any]):
         evaluate_open_trades(state, ex_clients, cfg)
         write_perf_csv(state, pfcfg.get("csv_path","perf_trades.csv"))
 
-    # persist state
-    save_state(state_path, state)
+    # persist state (positions + performance) back to Redis
+    save_state("ignored", state)
 
     # ===== Render logs =====
     tol_bps = (qcfg.get("merge_tolerance_bps", 50))  # basis points (0.50% default)
@@ -1020,7 +1062,7 @@ def run(cfg: Dict[str,Any]):
         for g in entries_view:
             sd_tag = " ✅SD" if g.get("sd_confluence") else ""
             exs = ",".join(g["exchanges"])
-            e0,e1 = g["entry_range"]; s0,s1 = g["stop_range"]
+            (e0,e1) = g["entry_range"]; (s0,s1) = g["stop_range"]
             t1rng = g.get("t1_range"); t2rng = g.get("t2_range")
             confrng = g.get("confidence_range")
             def _fmt_rng(a,b):
@@ -1035,10 +1077,7 @@ def run(cfg: Dict[str,Any]):
             if confrng:
                 c0,c1 = confrng
                 conf_txt = f" (conf {c0:.0f}–{c1:.0f})" if c0!=c1 else f" (conf {c0:.0f})"
-            print(
-                f"[ENTRY] [{exs}] {g['symbol']} {g['timeframe']} {g['type'].upper()} — {g['note']}{sd_tag}{conf_txt} — "
-                f"entry {e_txt} stop {s_txt} t1 {t1_txt} t2 {t2_txt}"
-            )
+            print(f"[ENTRY] [{exs}] {g['symbol']} {g['timeframe']} {g['type'].upper()} — {g['note']}{sd_tag}{conf_txt} — entry {e_txt} stop {s_txt} t1 {t1_txt} t2 {t2_txt}")
     else:
         print("No entry signals this run.")
 
@@ -1067,6 +1106,7 @@ def run(cfg: Dict[str,Any]):
             avgR = dfp["r_multiple"].mean() if "r_multiple" in dfp else 0.0
             print(f"[perf] closed trades: {len(dfp)} | win%: {win:.1f}% | avg R: {avgR:.2f}")
 
+    # Emit machine-readable payload too
     print(json.dumps(results, indent=2))
 
     # ===== Notifications =====
@@ -1085,8 +1125,7 @@ def run(cfg: Dict[str,Any]):
                         if g.get("confidence_range"):
                             c0,c1 = g["confidence_range"]
                             conf_txt = f" (conf {c0:.0f}–{c1:.0f})" if c0!=c1 else f" (conf {c0:.0f})"
-                        e0,e1 = g["entry_range"]; s0,s1 = g["stop_range"]
-                        # include t1/t2 explicitly in Telegram
+                        (e0,e1) = g["entry_range"]; (s0,s1) = g["stop_range"]
                         t1rng = g.get("t1_range"); t2rng = g.get("t2_range")
                         def _fmt_rng(a,b):
                             if a is None or b is None: return "-"
@@ -1127,8 +1166,7 @@ def run(cfg: Dict[str,Any]):
                         if g.get("confidence_range"):
                             c0,c1 = g["confidence_range"]
                             conf_txt = f" (conf {c0:.0f}–{c1:.0f})" if c0!=c1 else f" (conf {c0:.0f})"
-                        e0,e1 = g["entry_range"]; s0,s1 = g["stop_range"]
-                        # include t1/t2 explicitly in Discord
+                        (e0,e1) = g["entry_range"]; (s0,s1) = g["stop_range"]
                         t1rng = g.get("t1_range"); t2rng = g.get("t2_range")
                         def _fmt_rng(a,b):
                             if a is None or b is None: return "-"
@@ -1155,6 +1193,11 @@ def run(cfg: Dict[str,Any]):
     return results
 
 # ================== Entrypoint ==================
+def parse_csv_env(val):
+    if isinstance(val, list): return val
+    if isinstance(val, str): return [s.strip() for s in val.split(",") if s.strip()]
+    return []
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yml")
@@ -1169,4 +1212,12 @@ if __name__ == "__main__":
             return os.environ.get(obj[2:-1], obj)
         return obj
     cfg = expand_env(cfg)
+
+    # Init Redis (must exist)
+    try:
+        RDS = rds_from_cfg(cfg)
+    except Exception as e:
+        print("[fatal] cannot init Redis:", e)
+        sys.exit(1)
+
     run(cfg)
