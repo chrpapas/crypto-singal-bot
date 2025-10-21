@@ -1,28 +1,24 @@
-# Exchanges & universe
-exchanges: ${EXCHANGES}
-symbols_watchlist: ${SYMBOLS_WATCHLIST}
+# ===============================
+# Exchanges
+# ===============================
+exchanges:
+  - mexc
+  - gate
 
-# Notifications
-telegram:
-  enabled: false
-  bot_token: ${BOT_TOKEN}
-  chat_id: ${CHAT_ID}
+symbols_watchlist:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  - TAO/USDT
+  - ZEC/USDT
+  - DASH/USDT
 
-discord:
-  enabled: true
-  webhook: https://discord.com/api/webhooks/1429125113780899981/8jqvbb4Idij4GFWvFqaCGPdT2NBDnloP_aoleyY4Czxop0Gvfmv8kqQN019ynqmFb1y2
-
-# Quality / anti-noise profile
-quality:
-  profile: "balanced"                  # "safe" | "balanced" | "aggressive"
-  min_avg_dollar_vol_1h: 200000    # liquidity floor (avg $/1h over last 24 bars)
-  signal_cooldown_bars: 6          # min bars between signals for same pair/tf/type
-  require_two_closes_breakout: false
-  min_confidence: 70               # 0–100
-
-# DAY (1h)
+# ===============================
+# Day trade parameters
+# ===============================
 day_trade_params:
-  lookback_high: 20
+  lookback_high: 30
   vol_sma: 30
   rsi_min: 52
   rsi_max: 78
@@ -31,40 +27,40 @@ day_trade_params:
   btc_ema: 20
   stop_mode: swing
   atr_mult: 1.5
-
-  # Early-reversal (optional, safer thresholds)
   early_reversal:
     enabled: true
     require_ema_cross: true
     require_macd_cross: true
     min_rsi: 55
     max_extension_pct: 6
-    min_vol_mult: 1.0
-
-  # Multi-timeframe confirmation for entries
+    min_vol_mult: 1.2
   multi_tf:
     enabled: true
-    confirm_tfs: ["5m","15m","30m"]
+    confirm_tfs: ["5m", "15m", "30m"]
     min_confirmations: 3
     require_ema_stack: true
     require_macd_bull: true
     min_rsi: 52
 
-# SWING (4h)
+# ===============================
+# Swing trade parameters
+# ===============================
 swing_trade_params:
-  timeframe: "4h"
+  timeframe: 4h
   ema20: 20
   ema50: 50
   ema100: 100
-  pullback_pct_max: 10.0
+  pullback_pct_max: 10
   rsi_min: 50
   rsi_max: 70
   vol_sma: 20
-  breakout_lookback: 34
+  breakout_lookback: 55
   stop_mode: swing
-  atr_mult: 1.8
+  atr_mult: 2.0
 
-# TREND (1d)
+# ===============================
+# Trend trade parameters
+# ===============================
 trend_trade_params:
   ema20: 20
   ema50: 50
@@ -77,80 +73,131 @@ trend_trade_params:
   stop_mode: swing
   atr_mult: 2.0
 
-# Supply/Demand
+# ===============================
+# Supply/Demand Zones
+# ===============================
 supply_demand:
   enabled: true
-  mode: prefer
+  mode: prefer   # prefer | require
   timeframe_for_zones: 1h
   lookback: 300
   impulse_factor: 1.8
   zone_padding_pct: 0.25
   max_age_bars: 300
 
-# Movers: Top-500 by mcap + stronger filters
-movers:
-  enabled: true
-  source: cmc
-  cmc_api_key: ${CMC_API_KEY}
-  limit: 500
-  min_change_24h: 15.0
-  min_volume_usd_24h: 5000000
-  max_age_days: 365
-  quote: "USDT"
-
-# Exits (with day multi-TF bearish confirm)
-exits:
-  enabled: true
-  state_file: "state.json"
-  day:
-    rsi_drop_from: 70
-    rsi_drop_to: 60
-    ema_break: 20
-    macd_confirm: true
-    multi_tf:
-      enabled: true
-      confirm_tfs: ["5m","15m","30m"]
-      min_confirmations: 3
-      require_ema_bear: true
-      require_macd_bear: true
-      max_rsi: 50
-  swing:
-    rsi_below: 50
-    ema_break: 50
-    macd_confirm: true
-  trend:
-    rsi_below: 50
-    ema_cross_20_50: true
-    macd_confirm: true
-
-# Bearish setups (sell alerts)
+# ===============================
+# Bearish setups
+# ===============================
 bearish_signals:
   enabled: true
   day:
-    timeframe: "1h"
+    timeframe: 1h
     lookback_low: 20
     vol_sma: 20
-    rsi_max: 50
     require_breakdown: true
     require_vol_confirm: true
-    sd:
-      require_supply: false
+    rsi_max: 50
+  swing:
+    timeframe: 4h
+    lookback_low: 34
+    ema_stack_bear: true
+    require_vol_confirm: true
+    rsi_max: 50
+  trend:
+    timeframe: 1d
+    lookback_low: 55
+    ema20_below_50: true
+    rsi_max: 50
+
+# ===============================
+# Exits
+# ===============================
+exits:
+  enabled: true
+  edge_trigger: true
+  state_file: "state.json"
+  day:
+    ema_break: 20
+    rsi_drop_from: 70
+    rsi_drop_to: 60
+    macd_confirm: true
     multi_tf:
       enabled: true
-      confirm_tfs: ["5m","15m","30m"]
-      min_confirmations: 3
+      confirm_tfs: ["5m", "15m", "30m"]
+      min_confirmations: 2
       require_ema_bear: true
       require_macd_bear: true
       max_rsi: 50
   swing:
-    timeframe: "4h"
-    ema_stack_bear: true
-    lookback_low: 34
-    rsi_max: 50
-    require_vol_confirm: true
+    ema_break: 50
+    rsi_below: 50
+    macd_confirm: true
   trend:
-    timeframe: "1d"
-    ema20_below_50: true
-    lookback_low: 55
-    rsi_max: 50
-    require_vol_confirm: false
+    ema_cross_20_50: true
+    rsi_below: 50
+    macd_confirm: true
+
+# ===============================
+# Redis / File persistence
+# ===============================
+persistence:
+  backend: redis       # redis | file
+  key_prefix: spideybot:v1
+  ttl_minutes: 2880    # 2 days
+  redis_url: ${REDIS_URL}  # set in environment
+
+# Example for free Redis:
+# REDIS_URL="REDIS_URL="rediss://default:AYrFAAIncDE1ZDEwZjViZWNmZmY0ZTlkYjkyNWJkMTMwNWE2OTljMXAxMzU1MjU@probable-crappie-35525.upstash.io:6379""
+
+# ===============================
+# Quality filters
+# ===============================
+quality:
+  signal_cooldown_bars: 6
+  min_avg_dollar_vol_1h: 200000
+  require_two_closes_breakout: true
+  min_confidence: 70
+
+# ===============================
+# CoinMarketCap movers
+# ===============================
+movers:
+  enabled: true
+  limit: 500
+  min_change_24h: 15
+  min_volume_usd_24h: 5000000
+  max_age_days: 365
+  quote: USDT
+  cmc_api_key: ${CMC_API_KEY}
+
+# ===============================
+# Performance tracking
+# ===============================
+performance:
+  enabled: true
+  csv_path: "perf_trades.csv"
+  assume_fills: signal_close
+  tp_priority: target_first
+  max_bars_eval:
+    day: 180
+    swing: 180
+    trend: 300
+  use_exit_signals: true
+
+# ===============================
+# Notifications
+# ===============================
+telegram:
+  enabled: false
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
+
+discord:
+  enabled: true
+  webhook: https://discord.com/api/webhooks/1429125113780899981/8jqvbb4Idij4GFWvFqaCGPdT2NBDnloP_aoleyY4Czxop0Gvfmv8kqQN019ynqmFb1y2
+
+# ===============================
+# Output
+# ===============================
+output:
+  mode: compact
