@@ -144,7 +144,7 @@ persistence:
   backend: redis       # redis | file
   key_prefix: spideybot:v1
   ttl_minutes: 2880    # 2 days
-  redis_url: ${REDIS_URL}  # set in environment
+  redis_url: REDIS_URL="rediss://default:AYrFAAIncDE1ZDEwZjViZWNmZmY0ZTlkYjkyNWJkMTMwNWE2OTljMXAxMzU1MjU@probable-crappie-35525.upstash.io:6379"
 
 # Example for free Redis:
 # REDIS_URL="REDIS_URL="rediss://default:AYrFAAIncDE1ZDEwZjViZWNmZmY0ZTlkYjkyNWJkMTMwNWE2OTljMXAxMzU1MjU@probable-crappie-35525.upstash.io:6379""
