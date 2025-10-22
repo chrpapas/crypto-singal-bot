@@ -13,8 +13,7 @@ persistence:
   backend: redis
   key_prefix: spideybot:v1
   ttl_minutes: 2880           # 48h for edge memories
-  redis_url: "rediss://default:AYrFAAIncDE1ZDEwZjViZWNmZmY0ZTlkYjkyNWJkMTMwNWE2OTljMXAxMzU1MjU@probable-crappie-35525.upstash.io:6379"
-
+  redis_url: "rediss://default:AW1UAAIncDI4ODk3N2U4MDFhOTA0MmY4YjMxMTkyYmQwODBiYWI2MHAyMjc5ODg@central-possum-27988.upstash.io:6379"
 # --------------------------
 #  Trading Settings
 # --------------------------
