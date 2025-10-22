@@ -4,7 +4,7 @@
 
 exchanges: ["mexc"]
 
-symbols_watchlist: ${SYMBOLS_WATCHLIST}
+symbols_watchlist: ${WATCHLIST_SYMBOLS}
 
 # --------------------------
 #  Persistence (Redis)
