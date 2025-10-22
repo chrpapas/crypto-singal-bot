@@ -4,12 +4,7 @@
 
 exchanges: ["mexc"]
 
-symbols_watchlist:
-  - BTC/USDT
-  - ETH/USDT
-  - SOL/USDT
-  - BNB/USDT
-  - XRP/USDT
+symbols_watchlist: ${SYMBOLS_WATCHLIST}
 
 # --------------------------
 #  Persistence (Redis)
