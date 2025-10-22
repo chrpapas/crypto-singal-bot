@@ -1,0 +1,148 @@
+# ==========================
+#   MEXC Bear+Bull Bot Config
+# ==========================
+
+exchanges: ["mexc"]
+
+symbols_watchlist:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  - XRP/USDT
+
+# --------------------------
+#  Persistence (Redis)
+# --------------------------
+persistence:
+  backend: redis
+  key_prefix: spideybot:v1
+  ttl_minutes: 2880           # 48h for edge memories
+  redis_url: "rediss://default:AYrFAAIncDE1ZDEwZjViZWNmZmY0ZTlkYjkyNWJkMTMwNWE2OTljMXAxMzU1MjU@probable-crappie-35525.upstash.io:6379"
+
+# --------------------------
+#  Trading Settings
+# --------------------------
+trading:
+  paper: true                 # ✅ paper trading default
+  base_balance_usdt: 1000     # initial paper capital
+  risk_per_trade_pct: 1.0     # risk 1% per trade
+  max_concurrent_positions: 10
+  min_usdt_order: 10
+  live_market_slippage_bps: 10  # only relevant if live=true
+
+# --------------------------
+#  Bear-safe Mode
+# --------------------------
+bear_mode:
+  enabled: true
+  inverse_suffixes: ["3S", "5S"]   # tries BTC3S/USDT or BTC5S/USDT
+
+# --------------------------
+#  Movers (CoinMarketCap)
+# --------------------------
+movers:
+  enabled: true
+  limit: 500
+  min_change_24h: 15
+  min_volume_usd_24h: 5000000
+  max_age_days: 365
+  quote: USDT
+  cmc_api_key: ${CMC_API_KEY}    # set this in environment
+
+# --------------------------
+#  Day Trade Parameters (1h)
+# --------------------------
+day_trade_params:
+  lookback_high: 30
+  vol_sma: 30
+  rsi_min: 52
+  rsi_max: 78
+  btc_filter: true
+  btc_symbol: BTC/USDT
+  btc_ema: 20
+  stop_mode: swing
+  atr_mult: 1.5
+  early_reversal:
+    enabled: true
+  multi_tf: {}
+
+# --------------------------
+#  Swing Trade Parameters (4h)
+# --------------------------
+swing_trade_params:
+  ema20: 20
+  ema50: 50
+  ema100: 100
+  pullback_pct_max: 10.0
+  rsi_min: 50
+  rsi_max: 70
+  vol_sma: 20
+  breakout_lookback: 55
+  stop_mode: swing
+  atr_mult: 2.0
+  timeframe: 4h
+
+# --------------------------
+#  Trend Trade Parameters (1d)
+# --------------------------
+trend_trade_params:
+  ema20: 20
+  ema50: 50
+  ema100: 100
+  pullback_pct_max: 8.0
+  rsi_min: 50
+  rsi_max: 70
+  vol_sma: 20
+  breakout_lookback: 55
+  stop_mode: swing
+  atr_mult: 2.0
+
+# --------------------------
+#  Bearish Signal Parameters
+# --------------------------
+bearish_signals:
+  enabled: true
+  day:
+    timeframe: 1h
+    lookback_low: 20
+    vol_sma: 20
+    require_breakdown: true
+    require_vol_confirm: true
+    rsi_max: 50
+  swing:
+    timeframe: 4h
+    lookback_low: 34
+    require_vol_confirm: true
+    rsi_max: 50
+    ema_stack_bear: true
+  trend:
+    timeframe: 1d
+    lookback_low: 55
+    ema20_below_50: true
+    rsi_max: 50
+
+# --------------------------
+#  Supply & Demand Zones
+# --------------------------
+supply_demand:
+  enabled: true
+  impulse_factor: 1.8
+  zone_padding_pct: 0.25
+  max_age_bars: 300
+  timeframe_for_zones: 1h
+  lookback: 300
+  mode: prefer    # prefer/require
+
+# --------------------------
+#  Exit & Performance Settings
+# --------------------------
+exits:
+  enabled: true
+
+performance:
+  enabled: true
+
+quality:
+  min_confidence: 60
+  require_trend_alignment: false
