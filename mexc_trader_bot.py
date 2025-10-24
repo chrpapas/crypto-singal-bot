@@ -22,7 +22,6 @@ Environment
 - CMC_API_KEY (for movers, if enabled)
 - MEXC_WATCHLIST="BTC/USDT,ETH/USDT,..."
 - DISCORD_WEBHOOK_URL (or set in config)
-
 """
 
 import argparse, json, os, sys, yaml, requests, math
@@ -99,7 +98,7 @@ class DayParams:
     stop_mode: str = "swing"
     atr_mult: float = 1.5
     early_reversal: dict = field(default_factory=dict)
-    multi_tf: dict = field(default_factory=dict)  # <-- added for config compatibility
+    multi_tf: dict = field(default_factory=dict)  # ensure config compatibility
 
 @dataclass
 class TrendParams:
@@ -416,15 +415,20 @@ def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: D
         r_now = (px - entry) / risk; open_R += r_now
         open_details.append((sym, tr.get("timeframe",""), r_now, ((px/entry)-1.0)*100.0, entry, px))
     closed = perf.get("closed_trades", [])
+    win=avgR=medR=bestR=worstR=pfactor=0.0
     if closed:
-        dfc = pd.DataFrame(closed); win = float((dfc.get("r_multiple", 0) > 0).mean() * 100.0)
-        avgR = float(dfc.get("r_multiple", 0).mean()); medR = float(dfc.get("r_multiple", 0).median())
-        bestR = float(dfc.get("r_multiple", 0).max()); worstR = float(dfc.get("r_multiple", 0).min())
-        gains = dfc.loc[dfc.get("r_multiple", 0) > 0, "r_multiple"].sum()
-        losses = -dfc.loc[dfc.get("r_multiple", 0) < 0, "r_multiple"].sum()
-        pfactor = float(gains / losses) if losses > 0 else float('inf')
-    else:
-        win=avgR=medR=bestR=worstR=pfactor=0.0
+        dfc = pd.DataFrame(closed)
+        if "r_multiple" in dfc.columns:
+            win = float((dfc["r_multiple"] > 0).mean() * 100.0)
+            avgR = float(dfc["r_multiple"].mean())
+            medR = float(dfc["r_multiple"].median())
+            bestR = float(dfc["r_multiple"].max())
+            worstR = float(dfc["r_multiple"].min())
+            gains = dfc.loc[dfc["r_multiple"]>0, "r_multiple"].sum()
+            losses = -dfc.loc[dfc["r_multiple"]<0, "r_multiple"].sum()
+            pfactor = float(gains / losses) if losses > 0 else float('inf')
+        else:
+            win = float((dfc["outcome"].isin(["t1","t2"])).mean() * 100.0)
     print("\n--- Paper Performance Snapshot ---")
     print(f"Cash:      {pf.get('cash_usdt',0.0):.2f} USDT")
     print(f"Exposure:  {exposure:.2f} USDT  | Positions: {len(pf.get('holdings',{}))}")
@@ -612,7 +616,7 @@ def run(cfg: Dict[str,Any]):
             print(f"[scan-trend] {pair} err:", e)
 
     # Bearish -> inverse
-    if bearish_cfg.get("enabled", True) and bear_mode.get("enabled", True)):
+    if bearish_cfg.get("enabled", True) and bear_mode.get("enabled", True):
         for pair in scan_pairs_day:
             try:
                 df1h = client.ohlcv(pair, bearish_cfg.get("day", {}).get("timeframe","1h"), 300)
