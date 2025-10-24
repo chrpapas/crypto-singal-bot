@@ -146,6 +146,18 @@ resistance_filter:
   require_price_buffer_pct: 0.75   # don't buy if within 0.75% below a supply zone low
   do_not_buy_into_supply: true     # don't buy inside supply zone
 
-discord:
+
+exits:
   enabled: true
-  webhook_url: ${DISCORD_WEBHOOK_URL}
+  tp_plan: "50_25_trail"     # Option 2
+  trail_pct: 5               # trailing stop % for the final runner
+  use_exit_signals: true     # still log edge exits to signals channel
+
+discord:
+  signals:
+    enabled: true
+    webhook: ${DISCORD_SIGNALS_WEBHOOK}
+  trades:
+    enabled: true
+    webhook: ${DISCORD_TRADES_WEBHOOK}
+
