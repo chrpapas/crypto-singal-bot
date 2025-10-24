@@ -3,25 +3,35 @@
 
 """
 mexc_trader_bot.py — MEXC spot-only scanner/trader with:
-- Bear-safe inverse mapping for bearish setups
-- Paper portfolio & snapshot
-- Discord split channels (signals vs trades)
-- ✅ Automatic paper exits using Option 2 fills:
-    T1: sell 50% @ T1, stop->breakeven
-    T2: sell 25% @ T2, stop->EMA20 trail (if higher)
-    Stop: sell remainder @ stop
-    'target_first' priority on same-bar conflicts
+- Bear-safe mode (inverse "S" tokens) for bearish setups
+- Paper/live trading
+- Redis persistence (positions, portfolio, performance)
+- Dynamic Top-100 by market cap (CMC) as watchlist (optional)
+- Discord notifications split into two channels:
+    1) Signals channel = ONLY signal info (entries & exits), no 'skipped' or 'executed' text
+    2) Trades channel  = ONLY actual trades (paper or live), never 'none'
 
-Config keys mirror earlier versions; extra/unknown keys are ignored safely.
+Key config flags:
+- use_top100_dynamic_watchlist: true  # replaces symbols_watchlist/movers with CMC top-100 filtered to MEXC/USDT
+- discord:
+    enabled: true
+    signals_webhook: "..."
+    trades_webhook: "..."
+- trading.paper: true|false
+- trading.auto_sell_on_exit (paper only default true; live default false)
+
+Defensive config parsing:
+- Dataclasses are constructed with safe key filtering, so extra keys (e.g. 'multi_tf') won't crash.
 """
 
 import argparse, json, os, sys, yaml, requests, math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Dict, Any, List, Tuple, Set, Optional
 import pandas as pd
 import numpy as np
 import ccxt
 import redis
+from datetime import datetime, timezone
 
 # ================== TA helpers ==================
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
@@ -47,21 +57,25 @@ class ExClient:
             self.ex.apiKey = key
             self.ex.secret = sec
         self._markets = None
+
     def load_markets(self):
         if self._markets is None:
             try: self._markets = self.ex.load_markets()
             except Exception: self._markets = {}
         return self._markets
+
     def has_pair(self, symbol_pair: str) -> bool:
         mkts = self.load_markets() or {}
         if symbol_pair in mkts: return True
         syms = getattr(self.ex, "symbols", None) or []
         return symbol_pair in syms
+
     def ohlcv(self, symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
         rows = self.ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
         df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         return df.set_index("ts")
+
     def last_price(self, symbol: str) -> Optional[float]:
         try:
             t = self.ex.fetch_ticker(symbol)
@@ -73,6 +87,7 @@ class ExClient:
                 return float(df["close"].iloc[-1])
             except Exception:
                 return None
+
     def place_market(self, symbol: str, side: str, amount: float) -> dict:
         return self.ex.create_order(symbol, type="market", side=side, amount=amount)
 
@@ -88,8 +103,7 @@ class DayParams:
     btc_ema: int = 20
     stop_mode: str = "swing"
     atr_mult: float = 1.5
-    early_reversal: dict = field(default_factory=dict)
-    multi_tf: dict = field(default_factory=dict)  # kept for compatibility
+    # NOTE: multi_tf or any extra keys from config are ignored safely.
 
 @dataclass
 class TrendParams:
@@ -104,10 +118,12 @@ class TrendParams:
     stop_mode: str = "swing"
     atr_mult: float = 2.0
 
-def _sanitize_dataclass_kwargs(cls, d: dict) -> dict:
-    if not isinstance(d, dict): return {}
-    allowed = set(cls.__dataclass_fields__.keys())
-    return {k: v for k, v in d.items() if k in allowed}
+# ============== Safe dataclass parsing ==============
+def dataclass_from_cfg(dc_cls, d: Dict[str,Any]):
+    if not isinstance(d, dict): return dc_cls()
+    allowed = {f.name for f in fields(dc_cls)}
+    clean = {k:v for k,v in d.items() if k in allowed}
+    return dc_cls(**clean)
 
 # ================== Redis persistence ==================
 class RedisState:
@@ -117,24 +133,33 @@ class RedisState:
         self.prefix = prefix or "spideybot:v1"
         self.ttl_seconds = int(ttl_minutes) * 60 if ttl_minutes else 48*3600
         self.r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=6)
+        # smoke test
         self.r.setex(self.k("selftest"), self.ttl_seconds, pd.Timestamp.utcnow().isoformat())
         print(f"[persistence] Redis OK | prefix={self.prefix} | edge-ttl-min={self.ttl_seconds//60}")
+
     def k(self, *parts) -> str:
         return ":".join([self.prefix, *[str(p) for p in parts]])
+
+    # edge memories
     def get_mem(self, kind: str, key: str) -> str:
         return self.r.get(self.k("mem", kind, key)) or ""
     def set_mem(self, kind: str, key: str, bar_iso: str):
         self.r.setex(self.k("mem", kind, key), self.ttl_seconds, bar_iso)
+
+    # positions / performance
     def load_positions(self) -> Dict[str, Any]:
         txt = self.r.get(self.k("state","active_positions"))
         return json.loads(txt) if txt else {}
     def save_positions(self, d: Dict[str, Any]):
         self.r.set(self.k("state","active_positions"), json.dumps(d))
+
     def load_perf(self) -> Dict[str, Any]:
         txt = self.r.get(self.k("state","performance"))
         return json.loads(txt) if txt else {"open_trades": [], "closed_trades": []}
     def save_perf(self, d: Dict[str, Any]):
         self.r.set(self.k("state","performance"), json.dumps(d))
+
+    # portfolio (paper)
     def load_portfolio(self) -> Dict[str, Any]:
         txt = self.r.get(self.k("state","portfolio"))
         return json.loads(txt) if txt else {}
@@ -219,7 +244,7 @@ def trend_signal(df: pd.DataFrame, p: TrendParams, sd_cfg: Dict[str,Any], zones=
     return {"type":"trend","entry":entry,"stop":stop,"t1":round(entry*1.08,6),"t2":round(entry*1.20,6),
             "level":float(hl),"note":"Pullback-Bounce" if (within and bounce) else "Breakout"}
 
-# Bearish detectors → potential inverse longs
+# Bearish detectors
 def day_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any], sd_cfg: Dict[str,Any], zones=None):
     tf_cfg = cfg.get("day", {})
     look = int(tf_cfg.get("lookback_low", 20)); voln = int(tf_cfg.get("vol_sma", 20))
@@ -229,7 +254,7 @@ def day_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any], sd_cfg: Dict[str,An
     vol_ok = (last["volume"] > (volS.iloc[-1] if not np.isnan(volS.iloc[-1]) else last["volume"])) if tf_cfg.get("require_vol_confirm", True) else True
     rsi_weak = r.iloc[-1] <= tf_cfg.get("rsi_max", 50)
     if not (breakdown and vol_ok and rsi_weak): return None
-    entry = float(last["close"]); stop = float(last["high"])
+    entry = float(last["close"]); stop = float(last["high"])  # conservative
     return {"type":"bear_day","entry":entry,"stop":stop,"t1":None,"t2":None,
             "level":float(lowlvl),"note":"Bearish breakdown 1h","event_bar_ts": df.index[-1].isoformat()}
 
@@ -268,28 +293,16 @@ def btc_ok(ex: ExClient, dayp: DayParams) -> bool:
     except Exception:
         return True
 
-# ================== Movers (CMC Top-500 filtered to MEXC) ==================
-def fetch_cmc_top500_gainers(cfg: Dict[str,Any]) -> List[str]:
-    mv = cfg.get("movers", {})
-    if not mv.get("enabled"): return []
-    api_key = os.environ.get("CMC_API_KEY") or mv.get("cmc_api_key")
-    if not api_key:
-        print("[movers] enabled but no CMC_API_KEY — skipping"); return []
+# ================== CMC Top-100 Watchlist ==================
+def fetch_cmc_top100_symbols(api_key: str) -> List[str]:
     headers = {"X-CMC_PRO_API_KEY": api_key}
     url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-    params = {"limit": mv.get("limit", 500), "convert": "USD"}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=15)
-        data = r.json().get("data", [])
-    except Exception as e:
-        print("[movers] error:", e); return []
-    min_change = mv.get("min_change_24h", 15.0); min_vol = mv.get("min_volume_usd_24h", 5_000_000); max_age = mv.get("max_age_days", 365)
-    out=[]; now=pd.Timestamp.utcnow()
-    for it in data:
-        sym=it["symbol"].upper(); q=it.get("quote",{}).get("USD",{}); ch=(q.get("percent_change_24h") or 0); vol=(q.get("volume_24h") or 0)
-        date_added=pd.to_datetime(it.get("date_added", now.isoformat()), utc=True); age_days=(now-date_added).days
-        if (ch>=min_change) and (vol>=min_vol) and (age_days<=max_age): out.append(sym)
-    return out
+    params = {"limit": 100, "convert": "USD", "sort": "market_cap", "sort_dir": "desc"}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    symbols = [it["symbol"].upper() for it in data]
+    return symbols
 
 def filter_pairs_on_mexc(client: ExClient, symbols: List[str], quote: str="USDT") -> List[str]:
     client.load_markets()
@@ -308,10 +321,10 @@ def map_bearish_to_inverse_token(client: ExClient, pair: str, suffixes: List[str
             return alt
     return None
 
-# ================== Portfolio / performance ==================
+# ================== Performance + state helpers ==================
 def pos_key(exchange:str, pair:str, sig_type:str)->str: return f"{exchange}|{pair}|{sig_type}"
 
-def add_open_trade(perf: Dict[str,Any], *, exchange, symbol, tf, sig_type, entry, stop, t1, t2, event_ts, paper_qty: float = 0.0):
+def add_open_trade(perf: Dict[str,Any], *, exchange, symbol, tf, sig_type, entry, stop, t1, t2, event_ts):
     risk = max(1e-12, entry - stop)
     perf.setdefault("open_trades", []).append({
         "id": f"{exchange}|{symbol}|{tf}|{sig_type}|{event_ts}",
@@ -326,14 +339,6 @@ def add_open_trade(perf: Dict[str,Any], *, exchange, symbol, tf, sig_type, entry
         "t2": float(t2) if t2 else None,
         "risk": float(risk),
         "status": "open",
-        # progressive management state
-        "t1_done": False,
-        "t2_done": False,
-        "remaining_frac": 1.0,
-        "stop_moved_be": False,
-        "trail": "ema20",
-        # paper size for automated exits
-        "paper_qty": float(paper_qty or 0.0),
     })
 
 def update_positions_active(positions: Dict[str,Any], signal: Dict[str,Any]):
@@ -346,7 +351,7 @@ def remove_position(positions: Dict[str,Any], exchange:str, pair:str, sig_type:s
     ap = positions.setdefault("active_positions",{})
     ap.pop(pos_key(exchange,pair,sig_type), None)
 
-# ----- Paper portfolio helpers -----
+# ================== Paper portfolio ==================
 def ensure_portfolio(rds: RedisState, trading_cfg: Dict[str,Any]) -> Dict[str,Any]:
     pf = rds.load_portfolio()
     if not pf:
@@ -374,19 +379,6 @@ def paper_buy(rds: RedisState, pf: Dict[str,Any], symbol: str, price: float, qty
     rds.save_portfolio(pf)
     return True
 
-def paper_sell(rds: RedisState, pf: Dict[str,Any], symbol: str, price: float, qty: float) -> float:
-    """Sell partial qty from paper holdings."""
-    h = pf["holdings"].get(symbol)
-    if not h: return 0.0
-    sell_qty = min(float(qty), float(h["qty"]))
-    proceeds = price * sell_qty
-    h["qty"] -= sell_qty
-    if h["qty"] <= 1e-12:
-        pf["holdings"].pop(symbol, None)
-    pf["cash_usdt"] += proceeds
-    rds.save_portfolio(pf)
-    return proceeds
-
 def paper_sell_all(rds: RedisState, pf: Dict[str,Any], symbol: str, price: float) -> float:
     h = pf["holdings"].get(symbol)
     if not h: return 0.0
@@ -395,6 +387,31 @@ def paper_sell_all(rds: RedisState, pf: Dict[str,Any], symbol: str, price: float
     pf["holdings"].pop(symbol, None)
     rds.save_portfolio(pf)
     return proceeds
+
+# ================== Discord ==================
+def _discord_post(webhook: str, content: str):
+    if not webhook or not content.strip(): return
+    try:
+        requests.post(webhook, json={"content": content}, timeout=10)
+    except Exception as e:
+        print("[discord] err:", e)
+
+def fmt_signal_line(s: dict) -> str:
+    t1 = s.get('t1'); t2 = s.get('t2')
+    t1txt = f"{t1:.6f}" if t1 else "-"
+    t2txt = f"{t2:.6f}" if t2 else "-"
+    return (f"• `{s['symbol']}` {s['timeframe']} {s['type'].upper()} — {s.get('note','')}\n"
+            f"  entry `{s['entry']:.6f}` stop `{s['stop']:.6f}` t1 `{t1txt}` t2 `{t2txt}`")
+
+def fmt_exit_line(x: dict) -> str:
+    price = x.get("price")
+    ptxt = f" @ `{price:.6f}`" if price is not None else ""
+    return f"• `{x['symbol']}` {x['timeframe']} — {x['type']} — {x.get('reason','')}{ptxt}"
+
+def fmt_trade_line(ev: dict) -> str:
+    # ev: {side, symbol, qty, price, mode, timeframe}
+    return (f"• {ev['side'].upper()} `{ev['symbol']}` {ev.get('timeframe','')} "
+            f"qty `{ev['qty']:.6f}` @ `{ev['price']:.6f}` ({ev['mode']})")
 
 # ================== Paper performance snapshot ==================
 def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: Dict[str,Any]):
@@ -411,17 +428,37 @@ def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: D
         lines.append((sym, qty, avg, px, pnl, mv))
     equity = pf.get("cash_usdt", 0.0) + mv_total
     exposure = mv_total
+
     open_R = 0.0
+    open_details = []
     for tr in perf.get("open_trades", []):
-        sym = tr.get("symbol"); entry = float(tr.get("entry", 0.0)); risk = float(tr.get("risk", 1e-12))
+        sym = tr.get("symbol")
+        risk = float(tr.get("risk", 0.0)) or 1e-12
+        entry = float(tr.get("entry", 0.0))
         px = client.last_price(sym) or entry
-        open_R += (px - entry)/max(risk, 1e-12)
+        r_now = (px - entry) / risk
+        open_R += r_now
+        open_details.append((sym, tr.get("timeframe",""), r_now, ((px/entry)-1.0)*100.0, entry, px))
+
+    closed = perf.get("closed_trades", [])
+    win = 0.0; avgR = 0.0; medR = 0.0; bestR = 0.0; worstR = 0.0; pfactor = 0.0
+    if closed:
+        dfc = pd.DataFrame(closed)
+        if "r_multiple" in dfc:
+            win = float((dfc["r_multiple"] > 0).mean() * 100.0)
+            avgR = float(dfc["r_multiple"].mean()); medR=float(dfc["r_multiple"].median())
+            bestR=float(dfc["r_multiple"].max()); worstR=float(dfc["r_multiple"].min())
+            gains = dfc.loc[dfc["r_multiple"]>0, "r_multiple"].sum()
+            losses = -dfc.loc[dfc["r_multiple"]<0, "r_multiple"].sum()
+            pfactor = float(gains / losses) if losses > 0 else float("inf")
 
     print("\n--- Paper Performance Snapshot ---")
     print(f"Cash:      {pf.get('cash_usdt',0.0):.2f} USDT")
     print(f"Exposure:  {exposure:.2f} USDT  | Positions: {len(pf.get('holdings',{}))}")
     print(f"Equity:    {equity:.2f} USDT  | Unrealized PnL: {pnl_total:+.2f} USDT")
     print(f"Open R:    {open_R:+.2f} R (sum across open trades)")
+    if closed:
+        print(f"Closed n:  {len(closed)} | Win%: {win:.1f}% | AvgR: {avgR:.2f} | MedR: {medR:.2f} | PF: {pfactor if pfactor!=float('inf') else 'inf'} | Best/Worst R: {bestR:.2f}/{worstR:.2f}")
     if lines:
         lines.sort(key=lambda x: x[4], reverse=True)
         top = lines[:5]
@@ -429,211 +466,13 @@ def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: D
         for sym, qty, avg, last, pnl, mv in top:
             pct = ((last/avg)-1.0)*100.0 if avg>0 else 0.0
             print(f"  {sym}: qty={qty:.6f} avg={avg:.6f} last={last:.6f} | PnL={pnl:+.2f} USDT ({pct:+.2f}%)")
+    if open_details:
+        open_details.sort(key=lambda x: abs(x[2]), reverse=True)
+        topR = open_details[:5]
+        print("Top |R| open trades:")
+        for sym, tf, rnow, pct, entry, last in topR:
+            print(f"  {sym} {tf}: R={rnow:+.2f} | {pct:+.2f}% | entry={entry:.6f} last={last:.6f}")
     print("--- End Snapshot ---\n")
-
-# ================== Discord helpers (split channels) ==================
-def discord_post(webhook: str, content: str):
-    if not webhook: return
-    try:
-        requests.post(webhook, json={"content": content}, timeout=10)
-    except Exception as e:
-        print("[discord] post err:", e)
-
-def fmt_price(x):
-    try:
-        x = float(x)
-    except Exception:
-        return str(x)
-    if x == 0: return "0"
-    if x >= 100: return f"{x:.2f}"
-    if x >= 1:   return f"{x:.4f}"
-    return f"{x:.6f}"
-
-# ================== Evaluation (Option 2 fills) ==================
-def tf_to_limit(tf: str) -> int:
-    return 1000 if tf in ("1m","5m","15m","30m") else 500
-
-def _eval_next_event(bars: List[dict], *, entry, stop, t1, t2, priority="target_first"):
-    """
-    Iterate bars; return ('t1'|'t2'|'stop', price, ts) for the first hit.
-    Long-only.
-    priority: when same bar hits both target(s) and stop.
-    """
-    for b in bars:
-        hi, lo, ts = b["high"], b["low"], b["ts"]
-        hit_stop = (lo <= stop)
-        hit_t2   = (t2 is not None) and (hi >= t2)
-        hit_t1   = (t1 is not None) and (hi >= t1)
-        if hit_stop and (hit_t2 or hit_t1):
-            if priority == "target_first":
-                if hit_t2: return "t2", float(t2), ts
-                if hit_t1: return "t1", float(t1), ts
-                return "stop", float(stop), ts
-            else:
-                return "stop", float(stop), ts
-        if hit_stop: return "stop", float(stop), ts
-        if hit_t2:   return "t2", float(t2), ts
-        if hit_t1:   return "t1", float(t1), ts
-    return None, None, None
-
-def fetch_bars_since(client: ExClient, symbol: str, tf: str, since_ts: pd.Timestamp) -> List[dict]:
-    lim = tf_to_limit(tf)
-    df = client.ohlcv(symbol, tf, lim)
-    df = df.loc[pd.to_datetime(since_ts, utc=True):]
-    out=[]
-    for ts, row in df.iterrows():
-        out.append({"ts": ts, "open": float(row["open"]), "high": float(row["high"]), "low": float(row["low"]), "close": float(row["close"])})
-    return out
-
-def trailing_stop_from(df: pd.DataFrame, when_ts: pd.Timestamp, mode: str = "ema20") -> Optional[float]:
-    if mode != "ema20": return None
-    e20 = ema(df["close"], 20)
-    if when_ts in e20.index:
-        return float(e20.loc[when_ts])
-    # fallback closest previous
-    prev = e20[:when_ts]
-    if len(prev):
-        return float(prev.iloc[-1])
-    return None
-
-def evaluate_and_apply_paper_exits(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: Dict[str,Any],
-                                   *, priority="target_first", trades_wh: str = ""):
-    """
-    Walk each open paper trade forward using historical bars (Option 2 fills) and
-    execute partials/exits on the paper portfolio with Discord trade logs.
-    """
-    changed = False
-    new_closed: List[dict] = []
-
-    for tr in perf.get("open_trades", []):
-        if tr.get("status") != "open":
-            continue
-
-        sym = tr["symbol"]; tf = tr["timeframe"]
-        entry = float(tr["entry"]); stop = float(tr["stop"])
-        t1 = tr.get("t1"); t2 = tr.get("t2")
-        t1 = float(t1) if t1 else None
-        t2 = float(t2) if t2 else None
-        opened_at = pd.to_datetime(tr["opened_at"], utc=True)
-        paper_qty = float(tr.get("paper_qty", 0.0))
-
-        # No qty → nothing to apply at portfolio level (keep perf open)
-        if paper_qty <= 0.0:
-            continue
-
-        # Build a cursor timestamp of the last processed event
-        last_ts_str = tr.get("last_progress_ts") or tr["opened_at"]
-        cursor = pd.to_datetime(last_ts_str, utc=True)
-
-        # Fetch bars after cursor
-        bars = fetch_bars_since(client, sym, tf, cursor)
-        if len(bars) < 2:
-            continue
-
-        # We start evaluation from the bar AFTER the cursor bar (avoid double-filling)
-        eval_bars = bars[1:]
-
-        # Build a df for trailing stop computation if needed
-        df_full = client.ohlcv(sym, tf, tf_to_limit(tf))
-
-        # Progressive state
-        remaining_frac = float(tr.get("remaining_frac", 1.0))
-        cur_stop = float(tr.get("stop", stop))
-        t1_done = bool(tr.get("t1_done", False))
-        t2_done = bool(tr.get("t2_done", False))
-        stop_moved_be = bool(tr.get("stop_moved_be", False))
-
-        # Process events forward until nothing else hits
-        idx = 0
-        last_event_ts = cursor
-        while idx < len(eval_bars) and remaining_frac > 1e-9:
-            # Determine current levels to watch
-            cur_t1 = None if t1_done else t1
-            cur_t2 = None if t2_done else t2
-
-            evt, px, ts = _eval_next_event(eval_bars[idx:], entry=entry, stop=cur_stop, t1=cur_t1, t2=cur_t2, priority=priority)
-            if not evt:
-                break
-
-            last_event_ts = ts
-
-            if evt == "t1" and not t1_done and cur_t1 is not None:
-                # sell 50% at t1
-                qty = paper_qty * 0.50
-                got = paper_sell(rds, pf, sym, px, qty)
-                discord_post(trades_wh, f"• TP1 SELL {sym} {qty:.6f} @ {fmt_price(px)} (paper) | opened {tr['opened_at']} → t1 {ts.isoformat()}")
-                # update state
-                paper_qty -= qty
-                remaining_frac -= 0.50
-                tr["t1_done"] = True
-                tr["remaining_frac"] = remaining_frac
-                # move stop to breakeven
-                tr["stop"] = entry
-                cur_stop = entry
-                tr["stop_moved_be"] = True
-
-            elif evt == "t2" and not t2_done and cur_t2 is not None:
-                # sell 25% at t2
-                qty = paper_qty * 0.25 / remaining_frac  # 25% of original = 25% of current if we track paper_qty as remaining
-                qty = min(qty, paper_qty)
-                got = paper_sell(rds, pf, sym, px, qty)
-                discord_post(trades_wh, f"• TP2 SELL {sym} {qty:.6f} @ {fmt_price(px)} (paper) | opened {tr['opened_at']} → t2 {ts.isoformat()}")
-                # update state
-                paper_qty -= qty
-                remaining_frac -= 0.25
-                tr["t2_done"] = True
-                tr["remaining_frac"] = remaining_frac
-                # trail stop to EMA20 if higher
-                trail = trailing_stop_from(df_full, ts, mode=tr.get("trail","ema20"))
-                if trail is not None and trail > cur_stop:
-                    tr["stop"] = float(trail)
-                    cur_stop = float(trail)
-
-            elif evt == "stop":
-                # sell all remaining at stop
-                qty = paper_qty
-                if qty > 0:
-                    got = paper_sell(rds, pf, sym, px, qty)
-                    discord_post(trades_wh, f"• STOP SELL {sym} {qty:.6f} @ {fmt_price(px)} (paper) | opened {tr['opened_at']} → stop {ts.isoformat()}")
-                # finalize trade record
-                tr["status"] = "closed"
-                tr["closed_at"] = ts.isoformat()
-                tr["exit_price"] = float(px)
-                tr["outcome"] = "stop"
-                risk = float(tr.get("risk", max(1e-12, entry - cur_stop)))
-                tr["r_multiple"] = float((px - entry) / max(1e-12, risk))
-                tr["pct_return"] = float((px/entry - 1.0) * 100.0)
-                remaining_frac = 0.0
-                new_closed.append(tr)
-                changed = True
-                break
-
-            # advance index to the bar AFTER the event bar
-            # find event bar index
-            while idx < len(eval_bars) and eval_bars[idx]["ts"] <= ts:
-                idx += 1
-
-        # Persist progress if still open
-        tr["paper_qty"] = float(paper_qty)
-        tr["last_progress_ts"] = last_event_ts.isoformat()
-
-        # If fully exited on targets (no stop hit), consider closing runner if qty becomes tiny
-        if tr.get("status") == "open" and remaining_frac <= 0.001:
-            tr["status"] = "closed"
-            tr["closed_at"] = last_event_ts.isoformat()
-            tr["exit_price"] = float(eval_bars[max(0, idx-1)]["close"]) if idx>0 else float(df_full["close"].iloc[-1])
-            tr["outcome"] = "targets"
-            risk = float(tr.get("risk", max(1e-12, entry - stop)))
-            tr["r_multiple"] = float((tr["exit_price"] - entry) / max(1e-12, risk))
-            tr["pct_return"] = float((tr["exit_price"]/entry - 1.0) * 100.0)
-            new_closed.append(tr)
-            changed = True
-
-    # Move closed trades over, keep only open in open_trades
-    if changed:
-        still_open = [t for t in perf.get("open_trades", []) if t.get("status") == "open"]
-        perf["open_trades"] = still_open
-        perf.setdefault("closed_trades", []).extend(new_closed)
 
 # ================== MAIN ==================
 def run(cfg: Dict[str,Any]):
@@ -650,27 +489,61 @@ def run(cfg: Dict[str,Any]):
     risk_pct  = float(trading_cfg.get("risk_per_trade_pct", 1.0))
     max_pos   = int(trading_cfg.get("max_concurrent_positions", 10))
     slip_bps  = int(trading_cfg.get("live_market_slippage_bps", 10))
+    auto_sell_paper = bool(trading_cfg.get("auto_sell_on_exit", True))
+    auto_sell_live  = bool(trading_cfg.get("auto_sell_on_exit_live", False))
 
-    # Discord endpoints (split)
-    signals_wh = os.environ.get("DISCORD_SIGNALS_WEBHOOK", cfg.get("discord", {}).get("signals_webhook", ""))
-    trades_wh  = os.environ.get("DISCORD_TRADES_WEBHOOK",  cfg.get("discord", {}).get("trades_webhook", ""))
+    # Discord config
+    dcfg = cfg.get("discord", {"enabled": False})
+    discord_enabled = bool(dcfg.get("enabled", False))
+    sig_hook = dcfg.get("signals_webhook")
+    trd_hook = dcfg.get("trades_webhook")
 
-    # build watchset (env override supported)
-    env_wl = os.environ.get("MEXC_WATCHLIST","")
-    if env_wl.strip():
-        watchlist = [s.strip() for s in env_wl.split(",") if s.strip()]
+    # Build universe
+    watchlist: List[str] = []
+    movers_pairs: List[str] = []
+
+    # Dynamic Top-100 by market cap
+    if bool(cfg.get("use_top100_dynamic_watchlist", False)):
+        api_key = os.environ.get("CMC_API_KEY") or (cfg.get("movers", {}) or {}).get("cmc_api_key")
+        if not api_key:
+            print("[watchlist] Top100 mode requested but no CMC_API_KEY found. Falling back to symbols_watchlist.")
+            watchlist = cfg.get("symbols_watchlist", []) or []
+        else:
+            try:
+                syms_top100 = fetch_cmc_top100_symbols(api_key)
+                watchlist = filter_pairs_on_mexc(client, syms_top100, "USDT")
+                print(f"[watchlist] Top100 mode active — {len(watchlist)} MEXC pairs")
+            except Exception as e:
+                print("[watchlist] Top100 fetch err:", e)
+                watchlist = cfg.get("symbols_watchlist", []) or []
     else:
-        watchlist = cfg.get("symbols_watchlist", []) or []
+        # static list + optional movers (unchanged logic)
+        env_wl = os.environ.get("MEXC_WATCHLIST","")
+        if env_wl.strip():
+            watchlist = [s.strip() for s in env_wl.split(",") if s.strip()]
+        else:
+            watchlist = cfg.get("symbols_watchlist", []) or []
 
-    # movers filtered to MEXC
-    movers_pairs = []
-    if cfg.get("movers", {}).get("enabled", False):
-        try:
-            cmc_syms = fetch_cmc_top500_gainers(cfg)
-            movers_pairs = filter_pairs_on_mexc(client, cmc_syms, cfg.get("movers",{}).get("quote","USDT"))
-        except Exception as e:
-            print("[movers] err:", e)
+        if cfg.get("movers", {}).get("enabled", False):
+            try:
+                # reuse previous movers (500 gainers) filtered to MEXC
+                headers = {"X-CMC_PRO_API_KEY": os.environ.get("CMC_API_KEY") or cfg["movers"].get("cmc_api_key")}
+                if headers["X-CMC_PRO_API_KEY"]:
+                    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+                    params = {"limit": cfg["movers"].get("limit", 500), "convert": "USD"}
+                    r = requests.get(url, headers=headers, params=params, timeout=20)
+                    data = r.json().get("data", [])
+                    min_change = cfg["movers"].get("min_change_24h", 15.0)
+                    min_vol = cfg["movers"].get("min_volume_usd_24h", 5_000_000)
+                    now=pd.Timestamp.utcnow()
+                    raw = [d for d in data if (d.get("quote",{}).get("USD",{}).get("percent_change_24h",0)>=min_change and
+                                               d.get("quote",{}).get("USD",{}).get("volume_24h",0)>=min_vol)]
+                    movers_syms = [d["symbol"].upper() for d in raw]
+                    movers_pairs = filter_pairs_on_mexc(client, movers_syms, cfg["movers"].get("quote","USDT"))
+            except Exception as e:
+                print("[movers] err:", e)
 
+    # Final scan sets
     def uniq(seq): return list(dict.fromkeys(seq))
     base_pairs = [p for p in watchlist if client.has_pair(p)]
     scan_pairs_day   = uniq(base_pairs + movers_pairs)
@@ -691,15 +564,13 @@ def run(cfg: Dict[str,Any]):
             except Exception as e:
                 print(f"[zones] {pair} err:", e); zones_cache[pair]=[]
 
-    # Params
-    dayP   = DayParams(**_sanitize_dataclass_kwargs(DayParams, cfg.get("day_trade_params", {})))
+    # Params (safe)
+    dayP   = dataclass_from_cfg(DayParams, cfg.get("day_trade_params", {}))
     swingP = cfg.get("swing_trade_params", {"timeframe":"4h"})
-    trnP   = TrendParams(**_sanitize_dataclass_kwargs(TrendParams, cfg.get("trend_trade_params", {})))
+    trnP   = dataclass_from_cfg(TrendParams, cfg.get("trend_trade_params", {}))
     bearish_cfg = cfg.get("bearish_signals", {"enabled": False})
     exits_cfg   = cfg.get("exits", {"enabled": True})
-    qcfg        = cfg.get("quality", {})
-    pfcfg       = cfg.get("performance", {"enabled": True, "tp_priority": "target_first"})
-    priority    = pfcfg.get("tp_priority", "target_first")
+    pfcfg       = cfg.get("performance", {"enabled": True})
     bear_mode   = cfg.get("bear_mode", {"enabled": True})
     inv_suffix  = bear_mode.get("inverse_suffixes", ["3S","5S"])
 
@@ -708,9 +579,7 @@ def run(cfg: Dict[str,Any]):
     perf      = rds.load_perf()
     pf        = ensure_portfolio(rds, trading_cfg) if paper_mode else {}
 
-    results = {"ts": pd.Timestamp.utcnow().isoformat(), "signals": [], "movers": {"mexc": movers_pairs}}
-    signals_log_lines: List[str] = []
-    trades_log_lines: List[str]  = []
+    results = {"ts": pd.Timestamp.utcnow().isoformat(), "signals": [], "exit_signals": [], "movers": {"mexc": movers_pairs}}
 
     # ===== entries (bullish) =====
     allow_day = (not dayP.btc_filter) or btc_ok(client, dayP)
@@ -756,21 +625,22 @@ def run(cfg: Dict[str,Any]):
 
     # ===== bearish setups -> inverse longs if available =====
     if bearish_cfg.get("enabled", True) and bear_mode.get("enabled", True):
+        # DAY bearish
         for pair in scan_pairs_day:
             try:
                 df1h = client.ohlcv(pair, bearish_cfg.get("day", {}).get("timeframe","1h"), 300)
-                sig = day_bearish_signal(df1h, bearish_cfg, sd_cfg, zones_cache.get(pair))
+                zones = zones_cache.get(pair)
+                sig = day_bearish_signal(df1h, bearish_cfg, sd_cfg, zones)
                 if sig:
                     inv = map_bearish_to_inverse_token(client, pair, inv_suffix)
                     if inv:
                         sig.update({"symbol":inv,"timeframe":"1h","exchange":"mexc","type":"inverse","note":f"Inverse LONG from bearish {pair}"})
                         results["signals"].append(sig)
                     else:
-                        reason = f"No inverse token for {pair}"
-                        signals_log_lines.append(f"• {pair} 1h bear — skipped: {reason}")
-                        print(f"[bear-safe] {reason}")
+                        print(f"[bear-safe] No inverse token for {pair}")
             except Exception as e:
                 print(f"[bear-day] {pair} err:", e)
+        # SWING bearish
         for pair in scan_pairs_swing:
             try:
                 df4h = client.ohlcv(pair, bearish_cfg.get("swing", {}).get("timeframe","4h"), 400)
@@ -781,11 +651,10 @@ def run(cfg: Dict[str,Any]):
                         sig.update({"symbol":inv,"timeframe":"4h","exchange":"mexc","type":"inverse","note":f"Inverse LONG from bearish {pair}"})
                         results["signals"].append(sig)
                     else:
-                        reason = f"No inverse token for {pair}"
-                        signals_log_lines.append(f"• {pair} 4h bear — skipped: {reason}")
-                        print(f"[bear-safe] {reason}")
+                        print(f"[bear-safe] No inverse token for {pair}")
             except Exception as e:
                 print(f"[bear-swing] {pair} err:", e)
+        # TREND bearish
         for pair in scan_pairs_trend:
             try:
                 dfd = client.ohlcv(pair, bearish_cfg.get("trend", {}).get("timeframe","1d"), 320)
@@ -796,54 +665,33 @@ def run(cfg: Dict[str,Any]):
                         sig.update({"symbol":inv,"timeframe":"1d","exchange":"mexc","type":"inverse","note":f"Inverse LONG from bearish {pair}"})
                         results["signals"].append(sig)
                     else:
-                        reason = f"No inverse token for {pair}"
-                        signals_log_lines.append(f"• {pair} 1d bear — skipped: {reason}")
-                        print(f"[bear-safe] {reason}")
+                        print(f"[bear-safe] No inverse token for {pair}")
             except Exception as e:
                 print(f"[bear-trend] {pair} err:", e)
 
-    # ===== EXECUTE entries (paper or live), while LOGGING all signals =====
-    already_open_symbols = set()
-    for k, v in positions.get("active_positions", {}).items():
-        already_open_symbols.add(v["symbol"])
+    # ===== EXECUTE entries (paper or live) =====
+    already_open_symbols = {v["symbol"] for v in positions.get("active_positions", {}).values()}
     n_open = len(already_open_symbols)
 
-    actionable_signals = []
+    # capture trade events (for trades channel)
+    trade_events: List[Dict[str,Any]] = []
+
     for sig in results["signals"]:
         sym = sig["symbol"]; tf = sig["timeframe"]; typ = sig["type"]; entry = sig["entry"]; stop = sig["stop"]
-        t1 = sig.get("t1"); t2 = sig.get("t2"); note = sig.get("note","")
 
-        sig_line = (f"• {sym} {tf} {typ} — {note} | "
-                    f"entry {fmt_price(entry)} stop {fmt_price(stop)} "
-                    f"t1 {fmt_price(t1) if t1 else '-'} t2 {fmt_price(t2) if t2 else '-'}")
-
-        if sym in already_open_symbols:
-            reason = "already open"
-            signals_log_lines.append(sig_line + f"\n  skipped — {reason}")
-            print(f"[trade] skip {sym} — {reason}")
-            continue
-        if n_open >= max_pos:
-            reason = f"max_positions({max_pos})"
-            signals_log_lines.append(sig_line + f"\n  skipped — {reason}")
-            print(f"[trade] skip {sym} — {reason}")
+        # skip execution if already open or max positions reached
+        if (sym in already_open_symbols) or (n_open >= max_pos):
             continue
 
-        traded = False
-        got_qty = 0.0
+        # sizing/execution
         if paper_mode:
             equity = pf.get("cash_usdt", 0.0)
             qty = compute_qty_for_risk(entry, stop, equity, risk_pct)
-            if entry * qty < min_order or entry * qty > pf.get("cash_usdt", 0.0):
-                reason = "insufficient paper cash / below min order"
-                signals_log_lines.append(sig_line + f"\n  skipped — {reason}")
-                print(f"[paper] not enough cash or below min order for {sym} | need≈{entry*qty:.2f} USDT")
-            else:
-                ok = paper_buy(rds, pf, sym, entry, qty, min_order)
-                if ok:
-                    traded = True
-                    got_qty = qty
-                    trades_log_lines.append(f"• BUY {sym} {qty:.6f} @ {fmt_price(entry)} (paper)")
-                    print(f"[paper] BUY {sym} {qty:.6f} @ {entry:.6f}")
+            ok = paper_buy(rds, pf, sym, entry, qty, min_order)
+            if not ok:
+                continue
+            trade_events.append({"side":"buy","symbol":sym,"qty":qty,"price":entry,"mode":"paper","timeframe":tf})
+            print(f"[paper] BUY {sym} {qty:.6f} @ {entry:.6f}")
         else:
             try:
                 px = entry * (1 + slip_bps/10000.0)
@@ -852,73 +700,161 @@ def run(cfg: Dict[str,Any]):
                 qty = compute_qty_for_risk(entry, stop, equity, risk_pct)
                 notional = qty * px
                 if notional < min_order or notional > equity:
-                    reason = "insufficient live balance / below min"
-                    signals_log_lines.append(sig_line + f"\n  skipped — {reason}")
-                    print(f"[live] insufficient balance or below min for {sym}")
-                else:
-                    client.place_market(sym, "buy", qty)
-                    traded = True
-                    got_qty = qty
-                    trades_log_lines.append(f"• BUY {sym} {qty:.6f} @ ~{fmt_price(px)} (live)")
-                    print(f"[live] BUY {sym} {qty:.6f} @ ~{px:.6f}")
+                    continue
+                client.place_market(sym, "buy", qty)
+                trade_events.append({"side":"buy","symbol":sym,"qty":qty,"price":px,"mode":"live","timeframe":tf})
+                print(f"[live] BUY {sym} {qty:.6f} @ ~{px:.6f}")
             except Exception as e:
-                reason = f"order error: {e}"
-                signals_log_lines.append(sig_line + f"\n  skipped — {reason}")
-                print(f"[live] order err {sym}:", e)
+                print(f"[live] order err {sym}:", e); continue
 
-        if traded:
-            update_positions_active(positions, {"exchange":"mexc","symbol":sym,"type":typ,"entry":entry,"timeframe":tf})
-            add_open_trade(perf, exchange="mexc", symbol=sym, tf=tf, sig_type=typ, entry=entry, stop=stop,
-                           t1=t1, t2=t2, event_ts=sig.get("event_bar_ts", pd.Timestamp.utcnow().isoformat()),
-                           paper_qty=got_qty if paper_mode else 0.0)
-            already_open_symbols.add(sym); n_open += 1
-            actionable_signals.append(sig)
+        # register state & perf
+        signal_for_state = {"exchange":"mexc","symbol":sym,"type":typ if typ!="day" else "day","entry":entry,"timeframe":tf}
+        update_positions_active(positions, signal_for_state)
+        add_open_trade(perf, exchange="mexc", symbol=sym, tf=tf, sig_type=typ, entry=entry, stop=stop,
+                       t1=sig.get("t1"), t2=sig.get("t2"), event_ts=sig.get("event_bar_ts", pd.Timestamp.utcnow().isoformat()))
+        already_open_symbols.add(sym)
+        n_open += 1
 
-    # Save states (post-entry)
+    # ===== exits (edge-trigger) =====
+    if exits_cfg.get("enabled", True):
+        # collect active pairs regardless of watchlist
+        active_pairs = sorted({v["symbol"] for v in positions.get("active_positions", {}).values()})
+        check_pairs = sorted(set(base_pairs + active_pairs))
+        for pair in check_pairs:
+            try:
+                # Day exit (1h)
+                df1h = client.ohlcv(pair,"1h",200)
+                # simple exit: price < EMA20 or RSI momentum rollover
+                e20 = ema(df1h["close"], int(exits_cfg.get("day",{}).get("ema_break", 20)))
+                r = rsi(df1h["close"], 14)
+                exit_day = (df1h["close"].iloc[-1] < e20.iloc[-1]) and (r.iloc[-1] <= int(exits_cfg.get("day",{}).get("rsi_drop_to",60)))
+                if exit_day:
+                    px = float(df1h["close"].iloc[-1])
+                    results["exit_signals"].append({"type":"day_exit","reason":"Close<EMA20 & RSI down","symbol":pair,"timeframe":"1h","exchange":"mexc","price":px})
+                    # auto-sell if configured
+                    if paper_mode and auto_sell_paper and pair in pf.get("holdings", {}):
+                        proceeds = paper_sell_all(rds, pf, pair, px)
+                        remove_position(positions, "mexc", pair, "day")
+                        trade_events.append({"side":"sell","symbol":pair,"qty":0.0,"price":px,"mode":"paper","timeframe":"1h"})
+                    elif (not paper_mode) and auto_sell_live:
+                        try:
+                            h = client.ex.fetch_balance().get(pair.split("/")[0], {})
+                            qty = float(h.get("free", 0.0))
+                            if qty > 0:
+                                client.place_market(pair, "sell", qty)
+                                remove_position(positions, "mexc", pair, "day")
+                                trade_events.append({"side":"sell","symbol":pair,"qty":qty,"price":px,"mode":"live","timeframe":"1h"})
+                        except Exception as e:
+                            print(f"[live] sell err {pair}:", e)
+
+                # Swing exit (4h)
+                df4h = client.ohlcv(pair,"4h",300)
+                e50 = ema(df4h["close"], int(exits_cfg.get("swing",{}).get("ema_break", 50)))
+                r4 = rsi(df4h["close"], 14)
+                exit_sw = (df4h["close"].iloc[-1] < e50.iloc[-1]) and (r4.iloc[-1] <= int(exits_cfg.get("swing",{}).get("rsi_below",50)))
+                if exit_sw:
+                    px = float(df4h["close"].iloc[-1])
+                    results["exit_signals"].append({"type":"swing_exit","reason":"Close<EMA50 & RSI down","symbol":pair,"timeframe":"4h","exchange":"mexc","price":px})
+                    if paper_mode and auto_sell_paper and pair in pf.get("holdings", {}):
+                        proceeds = paper_sell_all(rds, pf, pair, px)
+                        remove_position(positions, "mexc", pair, "swing")
+                        trade_events.append({"side":"sell","symbol":pair,"qty":0.0,"price":px,"mode":"paper","timeframe":"4h"})
+                    elif (not paper_mode) and auto_sell_live:
+                        try:
+                            h = client.ex.fetch_balance().get(pair.split("/")[0], {})
+                            qty = float(h.get("free", 0.0))
+                            if qty > 0:
+                                client.place_market(pair, "sell", qty)
+                                remove_position(positions, "mexc", pair, "swing")
+                                trade_events.append({"side":"sell","symbol":pair,"qty":qty,"price":px,"mode":"live","timeframe":"4h"})
+                        except Exception as e:
+                            print(f"[live] sell err {pair}:", e)
+
+                # Trend exit (1d)
+                dfd = client.ohlcv(pair,"1d",320)
+                e20d, e50d = ema(dfd["close"],20), ema(dfd["close"],50)
+                rD = rsi(dfd["close"], 14)
+                exit_tr = (e20d.iloc[-1] < e50d.iloc[-1]) and (rD.iloc[-1] <= int(exits_cfg.get("trend",{}).get("rsi_below",50)))
+                if exit_tr:
+                    px = float(dfd["close"].iloc[-1])
+                    results["exit_signals"].append({"type":"trend_exit","reason":"EMA20<EMA50 & RSI down","symbol":pair,"timeframe":"1d","exchange":"mexc","price":px})
+                    if paper_mode and auto_sell_paper and pair in pf.get("holdings", {}):
+                        proceeds = paper_sell_all(rds, pf, pair, px)
+                        remove_position(positions, "mexc", pair, "trend")
+                        trade_events.append({"side":"sell","symbol":pair,"qty":0.0,"price":px,"mode":"paper","timeframe":"1d"})
+                    elif (not paper_mode) and auto_sell_live:
+                        try:
+                            h = client.ex.fetch_balance().get(pair.split("/")[0], {})
+                            qty = float(h.get("free", 0.0))
+                            if qty > 0:
+                                client.place_market(pair, "sell", qty)
+                                remove_position(positions, "mexc", pair, "trend")
+                                trade_events.append({"side":"sell","symbol":pair,"qty":qty,"price":px,"mode":"live","timeframe":"1d"})
+                        except Exception as e:
+                            print(f"[live] sell err {pair}:", e)
+
+            except Exception as e:
+                print(f"[exits] {pair} err:", e)
+
+    # Save states
     rds.save_positions(positions)
     rds.save_perf(perf)
 
-    # ===== Auto-manage paper exits using historical bars (Option 2) =====
-    if paper_mode and pfcfg.get("enabled", True):
-        evaluate_and_apply_paper_exits(client, rds, pf, perf, priority=priority, trades_wh=trades_wh)
-        rds.save_perf(perf)
-
-    # ===== Console Logs =====
+    # ===== Logs (console) =====
     print(f"=== MEXC Signals @ {results['ts']} ===")
-    print(f"Scanned — 1h:{len(scan_pairs_day)}  4h:{len(scan_pairs_swing)}  1d:{len(scan_pairs_trend)}  | watchlist:{len(base_pairs)}  movers:{len(movers_pairs)}")
+    print(f"Scanned — 1h:{len(scan_pairs_day)}  4h:{len(scan_pairs_swing)}  1d:{len(scan_pairs_trend)}  | universe:{len(base_pairs)}  movers:{len(movers_pairs)}")
     if results["movers"]["mexc"]:
         print("Movers (MEXC):", ", ".join(results["movers"]["mexc"]))
 
-    if actionable_signals:
-        for s in actionable_signals:
+    if results["signals"]:
+        for s in results["signals"]:
             print(f"[SIGNAL] {s['symbol']} {s['timeframe']} — {s['type']} — {s['note']} | entry {s['entry']:.6f} stop {s['stop']:.6f} t1 {s.get('t1')} t2 {s.get('t2')}")
     else:
-        print("No actionable signals.")
+        print("No signals.")
 
-    # ===== Paper performance snapshot (each run) =====
+    if results["exit_signals"]:
+        for x in results["exit_signals"]:
+            print(f"[EXIT] {x['symbol']} {x['timeframe']} — {x['type']} — {x['reason']} @ {x.get('price','-')}")
+    else:
+        print("No exit signals.")
+
+    # Paper snapshot each run
     if paper_mode:
         paper_snapshot(client, rds, pf, perf)
 
-    # ===== Discord — send both streams =====
-    if signals_log_lines:
-        head = f"🕹️ MEXC Bot @ {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n📊 Signals (executed / skipped)\n"
-        discord_post(signals_wh, head + "\n".join(signals_log_lines))
-    else:
-        discord_post(signals_wh, f"🕹️ MEXC Bot @ {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n📊 Signals (executed / skipped)\n• none")
+    # ===== Discord notifications =====
+    if discord_enabled:
+        # Signals channel: ONLY the signals & exit signals (no meta/skip)
+        sig_lines = []
+        if results["signals"]:
+            sig_lines.append(f"🕹️ MEXC Signals @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            sig_lines.append("**Buy/Inverse Signals**")
+            for s in results["signals"]:
+                sig_lines.append(fmt_signal_line(s))
+        if results["exit_signals"]:
+            if not sig_lines:
+                sig_lines.append(f"🕹️ MEXC Signals @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            sig_lines.append("**Exit Signals**")
+            for x in results["exit_signals"]:
+                sig_lines.append(fmt_exit_line(x))
+        if sig_lines:
+            _discord_post(sig_hook, "\n".join(sig_lines))
 
-    if trades_log_lines:
-        head = f"💼 Trades @ {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-        discord_post(trades_wh, head + "\n".join(trades_log_lines))
-    else:
-        discord_post(trades_wh, f"💼 Trades @ {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n• none")
+        # Trades channel: ONLY actual executed trades
+        if trade_events:
+            tr_lines = [f"💼 Trades @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"]
+            for ev in trade_events:
+                tr_lines.append(fmt_trade_line(ev))
+            _discord_post(trd_hook, "\n".join(tr_lines))
 
 # ================== Entrypoint ==================
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="mexc_trader_bot_config.yml")
+    ap.add_argument("--config", default="config.yml")
     args = ap.parse_args()
     with open(args.config,"r") as f: cfg = yaml.safe_load(f)
 
+    # Env ${VAR} expansion
     def expand_env(o):
         if isinstance(o, dict): return {k: expand_env(v) for k,v in o.items()}
         if isinstance(o, list): return [expand_env(x) for x in o]
@@ -927,8 +863,4 @@ if __name__ == "__main__":
         return o
     cfg = expand_env(cfg)
 
-    try:
-        run(cfg)
-    except Exception as e:
-        print("[fatal] run error:", e)
-        sys.exit(1)
+    run(cfg)
