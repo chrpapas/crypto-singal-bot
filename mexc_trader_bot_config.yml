@@ -1,13 +1,137 @@
-exits:
-  enabled: true
-  tp_plan: "50_25_trail"     # Option 2
-  trail_pct: 5               # trailing stop % for the final runner
-  use_exit_signals: true     # still log edge exits to signals channel
+# =========================
+# MEXC Trader Bot — Config
+# =========================
 
+# NOTE: You can override the watchlist at runtime via the env var:
+#   MEXC_WATCHLIST="BTC/USDT,ETH/USDT,SOL/USDT,TAO/USDT"
+symbols_watchlist:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - TAO/USDT
+  - F/USDT
+  - M/USDT
+
+# MEXC is the only exchange used by this bot; key/secret are read from env:
+#   MEXC_API_KEY, MEXC_SECRET
+
+# ---- Market regime filter (affects only Day/1h entries) ----
+day_trade_params:
+  lookback_high: 30
+  vol_sma: 30
+  rsi_min: 52
+  rsi_max: 78
+  btc_filter: true          # pause 1h entries if BTC < EMA(20) on 1h
+  btc_symbol: "BTC/USDT"
+  btc_ema: 20
+  stop_mode: "swing"        # "swing" = recent swing low; "atr" uses ATR
+  atr_mult: 1.5
+  early_reversal: {}        # kept for compatibility; not used by current script
+  multi_tf: {}              # kept for compatibility; not used by current script
+
+swing_trade_params:
+  timeframe: "4h"
+  ema20: 20
+  ema50: 50
+  ema100: 100
+  pullback_pct_max: 10.0
+  rsi_min: 50
+  vol_sma: 20
+  breakout_lookback: 34
+  stop_mode: "swing"
+  atr_mult: 2.0
+
+trend_trade_params:
+  ema20: 20
+  ema50: 50
+  ema100: 100
+  pullback_pct_max: 10.0
+  rsi_min: 50
+  rsi_max: 70
+  vol_sma: 20
+  breakout_lookback: 55
+  stop_mode: "swing"
+  atr_mult: 2.0
+
+# ---- Bearish setups (map to inverse tokens if available, e.g., XYZ3S/USDT) ----
+bearish_signals:
+  enabled: true
+  day:
+    timeframe: "1h"
+    lookback_low: 20
+    vol_sma: 20
+    require_breakdown: true
+    require_vol_confirm: true
+    rsi_max: 50
+  swing:
+    timeframe: "4h"
+    lookback_low: 34
+    ema_stack_bear: true
+    require_vol_confirm: true
+    rsi_max: 50
+  trend:
+    timeframe: "1d"
+    lookback_low: 55
+    ema20_below_50: true
+    rsi_max: 50
+
+# If a bearish setup triggers and an inverse spot token exists, we long it.
+bear_mode:
+  enabled: true
+  inverse_suffixes: ["3S", "5S"]
+
+# ---- Supply/Demand confluence (optional) ----
+supply_demand:
+  enabled: false           # set true if you want SD confluence checks
+  mode: "prefer"           # "prefer" or "require"
+  timeframe_for_zones: "1h"
+  lookback: 300
+  impulse_factor: 1.8
+  zone_padding_pct: 0.25
+  max_age_bars: 300
+
+# ---- Quality & hygiene (lightweight in this version) ----
+quality:
+  # If you want to enforce dollar-volume on 1h, turn this on in code later.
+  min_avg_dollar_vol_1h: 200000
+
+# ---- Performance / Exit engine (Option 2 is built-in) ----
+performance:
+  enabled: true
+  tp_priority: "target_first"   # when a bar hits both target and stop
+
+# ---- Exits (legacy block; the current script manages exits internally for paper) ----
+exits:
+  enabled: false
+
+# ---- Movers (CoinMarketCap Top-500 filtered to MEXC) ----
+movers:
+  enabled: true
+  limit: 500
+  min_change_24h: 15.0
+  min_volume_usd_24h: 5000000
+  max_age_days: 365
+  quote: "USDT"
+  cmc_api_key: ${CMC_API_KEY} # put your key in env; string literal ok too
+
+# ---- Trading settings ----
+trading:
+  paper: true                 # paper mode ON by default
+  base_balance_usdt: 1000     # starting cash for paper portfolio
+  risk_per_trade_pct: 1.0     # risk per trade as % of equity/cash
+  max_concurrent_positions: 10
+  min_usdt_order: 10
+  live_market_slippage_bps: 10  # only used in live mode
+
+# ---- Persistence (Redis) ----
+persistence:
+  key_prefix: "spideybot:v1"
+  ttl_minutes: 2880           # memory TTL for edge-dedup, etc.
+  redis_url:  "rediss://default:AW1UAAIncDI4ODk3N2U4MDFhOTA0MmY4YjMxMTkyYmQwODBiYWI2MHAyMjc5ODg@central-possum-27988.upstash.io:6379"   # e.g., rediss://USER:PASSWORD@host:port
+
+# ---- Discord (split channels) ----
+# You can also set env vars:
+#   DISCORD_SIGNALS_WEBHOOK, DISCORD_TRADES_WEBHOOK
 discord:
-  signals:
-    enabled: true
-    webhook: ${DISCORD_SIGNALS_WEBHOOK}
-  trades:
-    enabled: true
-    webhook: ${DISCORD_TRADES_WEBHOOK}
+  signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}
+  trades_webhook:  ${DISCORD_TRADES_WEBHOOK}
