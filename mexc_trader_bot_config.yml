@@ -140,3 +140,12 @@ performance:
 quality:
   min_confidence: 60
   require_trend_alignment: false
+
+resistance_filter:
+  enabled: true
+  require_price_buffer_pct: 0.75   # don't buy if within 0.75% below a supply zone low
+  do_not_buy_into_supply: true     # don't buy inside supply zone
+
+discord:
+  enabled: true
+  webhook_url: ${DISCORD_WEBHOOK_URL}
