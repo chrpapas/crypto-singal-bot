@@ -2,33 +2,53 @@
 # MEXC Trader Bot — Config
 # =========================
 
-# NOTE: You can override the watchlist at runtime via the env var:
-#   MEXC_WATCHLIST="BTC/USDT,ETH/USDT,SOL/USDT,TAO/USDT"
-symbols_watchlist:
-  - BTC/USDT
-  - ETH/USDT
-  - SOL/USDT
-  - TAO/USDT
-  - F/USDT
-  - M/USDT
+# Use CMC Top-100 (filtered to MEXC/USDT) instead of a manual watchlist
+use_top100_dynamic_watchlist: true
 
-# MEXC is the only exchange used by this bot; key/secret are read from env:
-#   MEXC_API_KEY, MEXC_SECRET
+# Optional manual list (used only if Top-100 mode is false OR CMC key missing)
+symbols_watchlist: []
 
-# ---- Market regime filter (affects only Day/1h entries) ----
+# Persistence (Redis)
+persistence:
+  key_prefix: spideybot:v1
+  ttl_minutes: 2880
+  redis_url: "rediss://default:AW1UAAIncDI4ODk3N2U4MDFhOTA0MmY4YjMxMTkyYmQwODBiYWI2MHAyMjc5ODg@central-possum-27988.upstash.io:6379"     # set in env
+
+# Trading & risk
+trading:
+  paper: true
+  base_balance_usdt: 1000
+  risk_per_trade_pct: 1.0
+  max_concurrent_positions: 10
+  min_usdt_order: 10
+  live_market_slippage_bps: 10
+  auto_sell_on_exit: true
+  auto_sell_on_exit_live: false
+
+# Discord webhooks (split channels) — pulled from ENV
+discord:
+  enabled: true
+  signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}  # env var
+  trades_webhook:  ${DISCORD_TRADES_WEBHOOK}   # env var
+
+# Bear-safe: map bearish setups to inverse tokens (e.g., BTC3S/USDT)
+bear_mode:
+  enabled: true
+  inverse_suffixes: ["3S","5S"]
+
+# Day (1h) entries
 day_trade_params:
   lookback_high: 30
   vol_sma: 30
   rsi_min: 52
   rsi_max: 78
-  btc_filter: true          # pause 1h entries if BTC < EMA(20) on 1h
+  btc_filter: true
   btc_symbol: "BTC/USDT"
   btc_ema: 20
-  stop_mode: "swing"        # "swing" = recent swing low; "atr" uses ATR
+  stop_mode: "swing"
   atr_mult: 1.5
-  early_reversal: {}        # kept for compatibility; not used by current script
-  multi_tf: {}              # kept for compatibility; not used by current script
 
+# Swing (4h) entries
 swing_trade_params:
   timeframe: "4h"
   ema20: 20
@@ -41,6 +61,7 @@ swing_trade_params:
   stop_mode: "swing"
   atr_mult: 2.0
 
+# Trend (1d) entries
 trend_trade_params:
   ema20: 20
   ema50: 50
@@ -53,7 +74,17 @@ trend_trade_params:
   stop_mode: "swing"
   atr_mult: 2.0
 
-# ---- Bearish setups (map to inverse tokens if available, e.g., XYZ3S/USDT) ----
+# Supply/Demand confluence (optional)
+supply_demand:
+  enabled: false
+  mode: "prefer"
+  timeframe_for_zones: "1h"
+  lookback: 300
+  impulse_factor: 1.8
+  zone_padding_pct: 0.25
+  max_age_bars: 300
+
+# Bearish detectors (feed bear-safe inverse longs)
 bearish_signals:
   enabled: true
   day:
@@ -65,73 +96,38 @@ bearish_signals:
     rsi_max: 50
   swing:
     timeframe: "4h"
-    lookback_low: 34
     ema_stack_bear: true
+    lookback_low: 34
     require_vol_confirm: true
     rsi_max: 50
   trend:
     timeframe: "1d"
-    lookback_low: 55
     ema20_below_50: true
+    lookback_low: 55
     rsi_max: 50
 
-# If a bearish setup triggers and an inverse spot token exists, we long it.
-bear_mode:
+# Exit logic
+exits:
   enabled: true
-  inverse_suffixes: ["3S", "5S"]
+  day:
+    ema_break: 20
+    rsi_drop_to: 60
+  swing:
+    ema_break: 50
+    rsi_below: 50
+  trend:
+    rsi_below: 50
 
-# ---- Supply/Demand confluence (optional) ----
-supply_demand:
-  enabled: false           # set true if you want SD confluence checks
-  mode: "prefer"           # "prefer" or "require"
-  timeframe_for_zones: "1h"
-  lookback: 300
-  impulse_factor: 1.8
-  zone_padding_pct: 0.25
-  max_age_bars: 300
-
-# ---- Quality & hygiene (lightweight in this version) ----
-quality:
-  # If you want to enforce dollar-volume on 1h, turn this on in code later.
-  min_avg_dollar_vol_1h: 200000
-
-# ---- Performance / Exit engine (Option 2 is built-in) ----
+# Performance (paper snapshot each run)
 performance:
   enabled: true
-  tp_priority: "target_first"   # when a bar hits both target and stop
 
-# ---- Exits (legacy block; the current script manages exits internally for paper) ----
-exits:
-  enabled: false
-
-# ---- Movers (CoinMarketCap Top-500 filtered to MEXC) ----
+# Movers / CMC (used for Top-100 universe)
 movers:
   enabled: true
-  limit: 500
-  min_change_24h: 15.0
-  min_volume_usd_24h: 5000000
-  max_age_days: 365
-  quote: "USDT"
-  cmc_api_key: ${CMC_API_KEY} # put your key in env; string literal ok too
-
-# ---- Trading settings ----
-trading:
-  paper: true                 # paper mode ON by default
-  base_balance_usdt: 1000     # starting cash for paper portfolio
-  risk_per_trade_pct: 1.0     # risk per trade as % of equity/cash
-  max_concurrent_positions: 10
-  min_usdt_order: 10
-  live_market_slippage_bps: 10  # only used in live mode
-
-# ---- Persistence (Redis) ----
-persistence:
-  key_prefix: "spideybot:v1"
-  ttl_minutes: 2880           # memory TTL for edge-dedup, etc.
-  redis_url:  "rediss://default:AW1UAAIncDI4ODk3N2U4MDFhOTA0MmY4YjMxMTkyYmQwODBiYWI2MHAyMjc5ODg@central-possum-27988.upstash.io:6379"   # e.g., rediss://USER:PASSWORD@host:port
-
-# ---- Discord (split channels) ----
-# You can also set env vars:
-#   DISCORD_SIGNALS_WEBHOOK, DISCORD_TRADES_WEBHOOK
-discord:
-  signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}
-  trades_webhook:  ${DISCORD_TRADES_WEBHOOK}
+  limit: 100
+  min_change_24h: -1000    # unused in Top-100 selection, safe default
+  min_volume_usd_24h: 0    # unused in Top-100 selection, safe default
+  max_age_days: 5000       # unused in Top-100 selection, safe default
+  quote: USDT
+  cmc_api_key: ${CMC_API_KEY}   # set in env
