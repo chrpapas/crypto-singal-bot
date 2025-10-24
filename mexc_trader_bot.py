@@ -2,46 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-mexc_trader_bot.py — MEXC spot-only scanner/trader with bear-safe mode and paper-performance snapshot.
+mexc_trader_bot.py — MEXC spot-only scanner/trader with bear-safe mode, Discord,
+resistance-aware entry filter, full signal logging, and paper-performance snapshot.
 
-What's new vs your last version:
-- [SIGNAL] lines are only printed for signals that are actionable (i.e., not already open).
-- A paper-performance snapshot is printed every run in paper mode (cash, equity, exposure, PnL, open R, closed-trade stats).
+Highlights
+----------
+- Spot-only (no margin). Bear-safe via inverse "S" tokens (e.g., BTC3S/USDT).
+- Paper mode by default; live optional (requires MEXC_API_KEY/MEXC_SECRET).
+- Logs *all* buy/sell signals (executed AND skipped) and why.
+- Skips buying into fresh supply (resistance) with configurable buffer.
+- Dedupes entry/exit per bar via Redis TTL memories.
+- Prints paper-performance snapshot every run (console only).
+- Discord webhook summary each run (optional).
 
-Config (config.yml) keys used (examples)
-----------------------------------------
-exchanges: ["mexc"]   # ignored; MEXC only
-symbols_watchlist: ["BTC/USDT","ETH/USDT","SOL/USDT"]  # can be overridden by env MEXC_WATCHLIST="BTC/USDT,ETH/USDT,..."
+Environment
+-----------
+- REDIS_URL (or set in config)
+- MEXC_API_KEY, MEXC_SECRET (only if live trading)
+- CMC_API_KEY (for movers, if enabled)
+- MEXC_WATCHLIST="BTC/USDT,ETH/USDT,..."
+- DISCORD_WEBHOOK_URL (or set in config)
 
-bear_mode:
-  enabled: true
-  inverse_suffixes: ["3S","5S"]
-
-persistence:
-  backend: redis
-  key_prefix: spideybot:v1
-  ttl_minutes: 2880
-  redis_url: "rediss://....upstash.io:6379"
-
-trading:
-  paper: true
-  base_balance_usdt: 1000
-  risk_per_trade_pct: 1.0
-  max_concurrent_positions: 10
-  min_usdt_order: 10
-  live_market_slippage_bps: 10
-
-movers:
-  enabled: true
-  limit: 500
-  min_change_24h: 15
-  min_volume_usd_24h: 5000000
-  max_age_days: 365
-  quote: USDT
-  cmc_api_key: ${CMC_API_KEY}
-
-day_trade_params / swing_trade_params / trend_trade_params / bearish_signals / supply_demand / exits / performance / quality
-— same as before.
 """
 
 import argparse, json, os, sys, yaml, requests, math
@@ -118,7 +99,6 @@ class DayParams:
     stop_mode: str = "swing"
     atr_mult: float = 1.5
     early_reversal: dict = field(default_factory=dict)
-    multi_tf: dict = field(default_factory=dict)
 
 @dataclass
 class TrendParams:
@@ -146,7 +126,7 @@ class RedisState:
         print(f"[persistence] Redis OK | prefix={self.prefix} | edge-ttl-min={self.ttl_seconds//60}")
     def k(self, *parts) -> str:
         return ":".join([self.prefix, *[str(p) for p in parts]])
-    # edge memories
+    # entry/exit edge memories
     def get_mem(self, kind: str, key: str) -> str:
         return self.r.get(self.k("mem", kind, key)) or ""
     def set_mem(self, kind: str, key: str, bar_iso: str):
@@ -195,7 +175,24 @@ def stop_from(df: pd.DataFrame, mode: str, atr_mult: float) -> float:
         return float(df["close"].iloc[-1] - atr_mult * a)
     return float(min(df["low"].iloc[-10:]))
 
-# ================== Signals ==================
+# ================== Resistance-aware filter ==================
+def blocked_by_supply(entry: float, zones: list, rf_cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    if not rf_cfg.get("enabled", True):
+        return False, ""
+    buf_pct = float(rf_cfg.get("require_price_buffer_pct", 0.75)) / 100.0  # percent of price
+    avoid_inside = rf_cfg.get("do_not_buy_into_supply", True)
+    for z in zones or []:
+        if z.get("type") != "supply": 
+            continue
+        low, high = float(z["low"]), float(z["high"])
+        if avoid_inside and (low <= entry <= high):
+            return True, f"entry inside supply {low:.6f}-{high:.6f}"
+        # within buffer below zone low -> likely to reject
+        if entry >= low * (1 - buf_pct) and entry <= low:
+            return True, f"near supply low {low:.6f} (buffer {buf_pct*100:.2f}%)"
+    return False, ""
+
+# ================== Signals (entries) ==================
 def day_signal(df: pd.DataFrame, p: DayParams, sd_cfg: Dict[str,Any], zones=None):
     look, voln = p.lookback_high, p.vol_sma
     if len(df) < max(look, voln)+5: return None
@@ -247,7 +244,7 @@ def trend_signal(df: pd.DataFrame, p: TrendParams, sd_cfg: Dict[str,Any], zones=
     return {"type":"trend","entry":entry,"stop":stop,"t1":round(entry*1.08,6),"t2":round(entry*1.20,6),
             "level":float(hl),"note":"Pullback-Bounce" if (within and bounce) else "Breakout"}
 
-# Bearish detectors
+# ================== Bearish detectors (map to inverse tokens) ==================
 def day_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any], sd_cfg: Dict[str,Any], zones=None):
     tf_cfg = cfg.get("day", {})
     look = int(tf_cfg.get("lookback_low", 20)); voln = int(tf_cfg.get("vol_sma", 20))
@@ -336,7 +333,7 @@ def map_bearish_to_inverse_token(client: ExClient, pair: str, suffixes: List[str
             return alt
     return None
 
-# ================== Performance + state helpers ==================
+# ================== Paper portfolio & perf helpers ==================
 def pos_key(exchange:str, pair:str, sig_type:str)->str: return f"{exchange}|{pair}|{sig_type}"
 
 def add_open_trade(perf: Dict[str,Any], *, exchange, symbol, tf, sig_type, entry, stop, t1, t2, event_ts):
@@ -366,7 +363,6 @@ def remove_position(positions: Dict[str,Any], exchange:str, pair:str, sig_type:s
     ap = positions.setdefault("active_positions",{})
     ap.pop(pos_key(exchange,pair,sig_type), None)
 
-# ================== Paper portfolio ==================
 def ensure_portfolio(rds: RedisState, trading_cfg: Dict[str,Any]) -> Dict[str,Any]:
     pf = rds.load_portfolio()
     if not pf:
@@ -403,55 +399,34 @@ def paper_sell_all(rds: RedisState, pf: Dict[str,Any], symbol: str, price: float
     rds.save_portfolio(pf)
     return proceeds
 
-# ================== Paper performance snapshot ==================
 def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: Dict[str,Any]):
-    # live price for each holding
-    mv_total = 0.0
-    pnl_total = 0.0
-    lines = []
+    mv_total = 0.0; pnl_total = 0.0; lines = []
     for sym, pos in sorted(pf.get("holdings", {}).items()):
         qty = float(pos["qty"]); avg = float(pos["avg"])
-        px = client.last_price(sym)
-        if px is None: 
-            last = avg
-        else:
-            last = float(px)
-        mv = qty * last
-        pnl = (last - avg) * qty
-        mv_total += mv
-        pnl_total += pnl
-        lines.append((sym, qty, avg, last, pnl, mv))
+        px = client.last_price(sym) or avg
+        mv = qty * px; pnl = (px - avg) * qty
+        mv_total += mv; pnl_total += pnl
+        lines.append((sym, qty, avg, px, pnl, mv))
     equity = pf.get("cash_usdt", 0.0) + mv_total
     exposure = mv_total
-    # match open_trades to compute R-unrealized
-    open_R = 0.0
-    open_details = []
+    # open R
+    open_R = 0.0; open_details = []
     for tr in perf.get("open_trades", []):
-        sym = tr.get("symbol")
-        risk = float(tr.get("risk", 0.0)) or 1e-12
-        entry = float(tr.get("entry", 0.0))
-        px = client.last_price(sym) or entry
-        r_now = (px - entry) / risk
-        open_R += r_now
+        sym = tr.get("symbol"); risk = float(tr.get("risk", 0.0)) or 1e-12
+        entry = float(tr.get("entry", 0.0)); px = client.last_price(sym) or entry
+        r_now = (px - entry) / risk; open_R += r_now
         open_details.append((sym, tr.get("timeframe",""), r_now, ((px/entry)-1.0)*100.0, entry, px))
     # closed stats
     closed = perf.get("closed_trades", [])
-    win = 0.0; avgR = 0.0; medR = 0.0; bestR = 0.0; worstR = 0.0; pfactor = 0.0
     if closed:
-        dfc = pd.DataFrame(closed)
-        # win rate (positive R)
-        if "r_multiple" in dfc:
-            win = float((dfc["r_multiple"] > 0).mean() * 100.0)
-            avgR = float(dfc["r_multiple"].mean())
-            medR = float(dfc["r_multiple"].median())
-            bestR = float(dfc["r_multiple"].max())
-            worstR = float(dfc["r_multiple"].min())
-            gains = dfc.loc[dfc["r_multiple"]>0, "r_multiple"].sum()
-            losses = -dfc.loc[dfc["r_multiple"]<0, "r_multiple"].sum()
-            pfactor = float(gains / losses) if losses > 0 else float("inf")
-        else:
-            win = float((dfc["outcome"].isin(["t1","t2"])).mean() * 100.0)
-    # print snapshot
+        dfc = pd.DataFrame(closed); win = float((dfc.get("r_multiple", 0) > 0).mean() * 100.0)
+        avgR = float(dfc.get("r_multiple", 0).mean()); medR = float(dfc.get("r_multiple", 0).median())
+        bestR = float(dfc.get("r_multiple", 0).max()); worstR = float(dfc.get("r_multiple", 0).min())
+        gains = dfc.loc[dfc.get("r_multiple", 0) > 0, "r_multiple"].sum()
+        losses = -dfc.loc[dfc.get("r_multiple", 0) < 0, "r_multiple"].sum()
+        pfactor = float(gains / losses) if losses > 0 else float('inf')
+    else:
+        win=avgR=medR=bestR=worstR=pfactor=0.0
     print("\n--- Paper Performance Snapshot ---")
     print(f"Cash:      {pf.get('cash_usdt',0.0):.2f} USDT")
     print(f"Exposure:  {exposure:.2f} USDT  | Positions: {len(pf.get('holdings',{}))}")
@@ -459,7 +434,6 @@ def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: D
     print(f"Open R:    {open_R:+.2f} R (sum across open trades)")
     if closed:
         print(f"Closed n:  {len(closed)} | Win%: {win:.1f}% | AvgR: {avgR:.2f} | MedR: {medR:.2f} | PF: {pfactor if pfactor!=float('inf') else 'inf'} | Best/Worst R: {bestR:.2f}/{worstR:.2f}")
-    # top by PnL
     if lines:
         lines.sort(key=lambda x: x[4], reverse=True)
         top = lines[:5]
@@ -467,7 +441,6 @@ def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: D
         for sym, qty, avg, last, pnl, mv in top:
             pct = ((last/avg)-1.0)*100.0 if avg>0 else 0.0
             print(f"  {sym}: qty={qty:.6f} avg={avg:.6f} last={last:.6f} | PnL={pnl:+.2f} USDT ({pct:+.2f}%)")
-    # top by |R|
     if open_details:
         open_details.sort(key=lambda x: abs(x[2]), reverse=True)
         topR = open_details[:5]
@@ -475,6 +448,45 @@ def paper_snapshot(client: ExClient, rds: RedisState, pf: Dict[str,Any], perf: D
         for sym, tf, rnow, pct, entry, last in topR:
             print(f"  {sym} {tf}: R={rnow:+.2f} | {pct:+.2f}% | entry={entry:.6f} last={last:.6f}")
     print("--- End Snapshot ---\n")
+
+# ================== Discord ==================
+def send_discord_message(webhook_url: str, content: str):
+    if not webhook_url or not content: return
+    parts = [content[i:i+1900] for i in range(0, len(content), 1900)]
+    for p in parts:
+        try:
+            requests.post(webhook_url, json={"content": p}, timeout=10)
+        except Exception as e:
+            print("[discord] send err:", e)
+
+def build_discord_summary(ts: str, signal_logs: list, executed: list, sell_logs: list) -> str:
+    lines = [f"**🕹️ MEXC Bot @ {ts}**"]
+    # Executed
+    lines.append("\n**✅ Executed Buys**")
+    if executed:
+        for s in executed:
+            lines.append(f"• {s['symbol']} {s['timeframe']} {s['type']} — {s.get('note','')}\n"
+                         f"  entry `{s['entry']:.6f}` stop `{s['stop']:.6f}`")
+    else:
+        lines.append("• none")
+    # All buy signals with status
+    lines.append("\n**📊 Buy Signals (executed / skipped)**")
+    if signal_logs:
+        for r in signal_logs:
+            reason = f" — {r['reason']}" if r.get("reason") else ""
+            lines.append(f"• {r['symbol']} {r['timeframe']} {r['type']} — {r.get('note','')}\n"
+                         f"  {r['status']}{reason}")
+    else:
+        lines.append("• none")
+    # Sells
+    lines.append("\n**🔻 Sell Signals**")
+    if sell_logs:
+        for s in sell_logs:
+            lines.append(f"• {s['symbol']} {s['timeframe']} {s['type']} — {s['note']}\n"
+                         f"  price `{s.get('price','?')}` invalidate>`{s.get('invalidate_above','?')}` level `{s.get('level','?')}`")
+    else:
+        lines.append("• none")
+    return "\n".join(lines)
 
 # ================== MAIN ==================
 def run(cfg: Dict[str,Any]):
@@ -492,7 +504,7 @@ def run(cfg: Dict[str,Any]):
     max_pos   = int(trading_cfg.get("max_concurrent_positions", 10))
     slip_bps  = int(trading_cfg.get("live_market_slippage_bps", 10))
 
-    # build watchset (env override supported)
+    # watchlist (env override supported)
     env_wl = os.environ.get("MEXC_WATCHLIST","")
     if env_wl.strip():
         watchlist = [s.strip() for s in env_wl.split(",") if s.strip()]
@@ -532,19 +544,26 @@ def run(cfg: Dict[str,Any]):
     dayP   = DayParams(**cfg.get("day_trade_params", {}))
     swingP = cfg.get("swing_trade_params", {"timeframe":"4h"})
     trnP   = TrendParams(**cfg.get("trend_trade_params", {}))
-    bearish_cfg = cfg.get("bearish_signals", {"enabled": False})
+    bearish_cfg = cfg.get("bearish_signals", {"enabled": True})
     exits_cfg   = cfg.get("exits", {"enabled": True})
-    qcfg        = cfg.get("quality", {})
     pfcfg       = cfg.get("performance", {"enabled": True})
     bear_mode   = cfg.get("bear_mode", {"enabled": True})
     inv_suffix  = bear_mode.get("inverse_suffixes", ["3S","5S"])
+    rf_cfg      = cfg.get("resistance_filter", {  # defaults if not present
+        "enabled": True,
+        "require_price_buffer_pct": 0.75,
+        "do_not_buy_into_supply": True
+    })
 
     # Load states
     positions = rds.load_positions()
     perf      = rds.load_perf()
     pf        = ensure_portfolio(rds, trading_cfg) if paper_mode else {}
 
-    results = {"ts": pd.Timestamp.utcnow().isoformat(), "signals": [], "exit_signals": [], "sell_signals": [], "movers": {"mexc": movers_pairs}}
+    results = {"ts": pd.Timestamp.utcnow().isoformat(), "signals": [], "sell_signals": [], "movers": {"mexc": movers_pairs}}
+    signal_logs: List[Dict[str,Any]] = []   # buy signals (executed or skipped) with status+reason
+    executed_signals: List[Dict[str,Any]] = []
+    sell_logs: List[Dict[str,Any]] = []
 
     # ===== entries (bullish) =====
     allow_day = (not dayP.btc_filter) or btc_ok(client, dayP)
@@ -558,8 +577,16 @@ def run(cfg: Dict[str,Any]):
             zones = zones_cache.get(pair)
             sig = day_signal(df1h, dayP, sd_cfg, zones)
             if sig and allow_day:
+                # resistance-aware gate
+                blk, why = blocked_by_supply(sig["entry"], zones, rf_cfg) if rf_cfg else (False,"")
                 sig.update({"symbol":pair,"timeframe":"1h","exchange":"mexc"})
-                results["signals"].append(sig)
+                if blk:
+                    signal_logs.append({**sig, "status":"skipped", "reason":f"resistance: {why}"})
+                else:
+                    results["signals"].append(sig)
+            elif sig and not allow_day:
+                sig.update({"symbol":pair,"timeframe":"1h","exchange":"mexc"})
+                signal_logs.append({**sig, "status":"skipped", "reason":"btc_filter"})
         except Exception as e:
             print(f"[scan-day] {pair} err:", e)
 
@@ -571,8 +598,12 @@ def run(cfg: Dict[str,Any]):
             zones = zones_cache.get(pair)
             sig = swing_signal(df4h, swingP, sd_cfg, zones)
             if sig:
+                blk, why = blocked_by_supply(sig["entry"], zones, rf_cfg) if rf_cfg else (False,"")
                 sig.update({"symbol":pair,"timeframe":tf_swing,"exchange":"mexc"})
-                results["signals"].append(sig)
+                if blk:
+                    signal_logs.append({**sig, "status":"skipped", "reason":f"resistance: {why}"})
+                else:
+                    results["signals"].append(sig)
         except Exception as e:
             print(f"[scan-swing] {pair} err:", e)
 
@@ -583,8 +614,12 @@ def run(cfg: Dict[str,Any]):
             zones = zones_cache.get(pair)
             sig = trend_signal(dfd, trnP, sd_cfg, zones)
             if sig:
+                blk, why = blocked_by_supply(sig["entry"], zones, rf_cfg) if rf_cfg else (False,"")
                 sig.update({"symbol":pair,"timeframe":"1d","exchange":"mexc"})
-                results["signals"].append(sig)
+                if blk:
+                    signal_logs.append({**sig, "status":"skipped", "reason":f"resistance: {why}"})
+                else:
+                    results["signals"].append(sig)
         except Exception as e:
             print(f"[scan-trend] {pair} err:", e)
 
@@ -602,7 +637,9 @@ def run(cfg: Dict[str,Any]):
                         sig.update({"symbol":inv,"timeframe":"1h","exchange":"mexc","type":"inverse","note":f"Inverse LONG from bearish {pair}"})
                         results["signals"].append(sig)
                     else:
-                        print(f"[bear-safe] No inverse token for {pair}")
+                        # log skipped (no inverse token)
+                        temp = {"symbol":pair,"timeframe":"1h","exchange":"mexc","type":"inverse","note":f"bearish {pair}→no inverse", "entry":sig["entry"],"stop":sig["stop"]}
+                        signal_logs.append({**temp,"status":"skipped","reason":"no_inverse_token"})
             except Exception as e:
                 print(f"[bear-day] {pair} err:", e)
         # SWING bearish
@@ -616,7 +653,8 @@ def run(cfg: Dict[str,Any]):
                         sig.update({"symbol":inv,"timeframe":"4h","exchange":"mexc","type":"inverse","note":f"Inverse LONG from bearish {pair}"})
                         results["signals"].append(sig)
                     else:
-                        print(f"[bear-safe] No inverse token for {pair}")
+                        temp = {"symbol":pair,"timeframe":"4h","exchange":"mexc","type":"inverse","note":f"bearish {pair}→no inverse", "entry":sig["entry"],"stop":sig["stop"]}
+                        signal_logs.append({**temp,"status":"skipped","reason":"no_inverse_token"})
             except Exception as e:
                 print(f"[bear-swing] {pair} err:", e)
         # TREND bearish
@@ -630,40 +668,53 @@ def run(cfg: Dict[str,Any]):
                         sig.update({"symbol":inv,"timeframe":"1d","exchange":"mexc","type":"inverse","note":f"Inverse LONG from bearish {pair}"})
                         results["signals"].append(sig)
                     else:
-                        print(f"[bear-safe] No inverse token for {pair}")
+                        temp = {"symbol":pair,"timeframe":"1d","exchange":"mexc","type":"inverse","note":f"bearish {pair}→no inverse", "entry":sig["entry"],"stop":sig["stop"]}
+                        signal_logs.append({**temp,"status":"skipped","reason":"no_inverse_token"})
             except Exception as e:
                 print(f"[bear-trend] {pair} err:", e)
 
     # ===== EXECUTE entries (paper or live) =====
-    already_open_symbols = set()
-    for k, v in positions.get("active_positions", {}).items():
-        already_open_symbols.add(v["symbol"])
-
+    # Dedup by bar edge (avoid duplicate signals per timeframe/note)
+    def entry_edge_key(sig):
+        return f"{sig['exchange']}|{sig['symbol']}|{sig['timeframe']}|{sig['type']}|{sig.get('note','')}"
+    actionable_signals = []
+    already_open_symbols = set(v["symbol"] for v in positions.get("active_positions", {}).values())
     n_open = len(already_open_symbols)
 
-    actionable_signals = []
     for sig in results["signals"]:
         sym = sig["symbol"]; tf = sig["timeframe"]; typ = sig["type"]; entry = sig["entry"]; stop = sig["stop"]
+        # Edge dedup
+        edge_key = entry_edge_key(sig)
+        last_ev = rds.get_mem("entry_edge", edge_key)
+        evts = sig.get("event_bar_ts") or pd.Timestamp.utcnow().isoformat()
+        if last_ev == evts:
+            # Logged as skipped (duplicate bar)
+            signal_logs.append({**sig, "status":"skipped", "reason":"dedup_same_bar"})
+            continue
+        rds.set_mem("entry_edge", edge_key, evts)
 
-        # if already open, skip execution and skip printing [SIGNAL]
+        # If already open
         if sym in already_open_symbols:
-            print(f"[trade] skip {sym} — already open")
+            signal_logs.append({**sig, "status":"skipped", "reason":"already_open"})
             continue
-
-        # max positions guard
+        # Max positions guard
         if n_open >= max_pos:
-            print(f"[trade] skip {sym} — max positions reached ({max_pos})")
+            signal_logs.append({**sig, "status":"skipped", "reason":f"max_positions({max_pos})"})
             continue
 
-        actionable_signals.append(sig)
-
-        # sizing/execution
+        # Try to execute
         if paper_mode:
             equity = pf.get("cash_usdt", 0.0)
             qty = compute_qty_for_risk(entry, stop, equity, risk_pct)
+            if entry * qty < min_order:
+                signal_logs.append({**sig, "status":"skipped", "reason":"below_min_order"})
+                continue
+            if entry * qty > equity:
+                signal_logs.append({**sig, "status":"skipped", "reason":"insufficient_cash"})
+                continue
             ok = paper_buy(rds, pf, sym, entry, qty, min_order)
             if not ok:
-                print(f"[paper] not enough cash or below min order for {sym} | need≈{entry*qty:.2f} USDT")
+                signal_logs.append({**sig, "status":"skipped", "reason":"paper_buy_failed"})
                 continue
             print(f"[paper] BUY {sym} {qty:.6f} @ {entry:.6f}")
         else:
@@ -673,17 +724,23 @@ def run(cfg: Dict[str,Any]):
                 equity = float(bal)
                 qty = compute_qty_for_risk(entry, stop, equity, risk_pct)
                 notional = qty * px
-                if notional < min_order or notional > equity:
-                    print(f"[live] insufficient balance or below min for {sym}")
+                if notional < min_order:
+                    signal_logs.append({**sig, "status":"skipped", "reason":"below_min_order"})
+                    continue
+                if notional > equity:
+                    signal_logs.append({**sig, "status":"skipped", "reason":"insufficient_balance"})
                     continue
                 client.place_market(sym, "buy", qty)
                 print(f"[live] BUY {sym} {qty:.6f} @ ~{px:.6f}")
             except Exception as e:
-                print(f"[live] order err {sym}:", e); continue
+                signal_logs.append({**sig, "status":"skipped", "reason":f"live_order_error:{e}"})
+                continue
 
-        # register state & perf
-        signal_for_state = {"exchange":"mexc","symbol":sym,"type":typ if typ!="day" else "day","entry":entry,"timeframe":tf}
-        update_positions_active(positions, signal_for_state)
+        # If we reach here, executed
+        actionable_signals.append(sig)
+        executed_signals.append(sig)
+        signal_logs.append({**sig, "status":"executed"})
+        update_positions_active(positions, {"exchange":"mexc","symbol":sym,"type":typ if typ!="day" else "day","entry":entry,"timeframe":tf})
         add_open_trade(perf, exchange="mexc", symbol=sym, tf=tf, sig_type=typ, entry=entry, stop=stop,
                        t1=sig.get("t1"), t2=sig.get("t2"), event_ts=sig.get("event_bar_ts", pd.Timestamp.utcnow().isoformat()))
         already_open_symbols.add(sym)
@@ -693,22 +750,55 @@ def run(cfg: Dict[str,Any]):
     rds.save_positions(positions)
     rds.save_perf(perf)
 
+    # ===== SELL signals (bearish notifications only; no trades) =====
+    # They’re already pushed into signal_logs if they translate to inverse, otherwise we just collect:
+    # Also, log pure bearish setups for visibility:
+    # (We already mapped to inverse above. For completeness, gather a human-friendly list.)
+    for s in results.get("signals", []):
+        # inverse entries are already buy entries; sell_logs kept separate for pure bearish (below)
+        pass
+    # We can build sell_logs from bearish_cfg again just for logging clarity (no extra calls):
+    # To avoid re-fetch, we rely on earlier pipeline where we had 'no_inverse_token' reasons added to signal_logs.
+    # For Discord section, also add explicit 'sell_logs' for readability:
+    for item in signal_logs:
+        if item.get("type","").startswith("bear_") or (item.get("type")=="inverse" and "bearish" in (item.get("note") or "").lower()):
+            sell_logs.append({
+                "symbol": item.get("symbol"),
+                "timeframe": item.get("timeframe"),
+                "type": item.get("type"),
+                "note": item.get("note", ""),
+                "price": item.get("entry"),
+                "invalidate_above": None,
+                "level": None
+            })
+
     # ===== Logs =====
     print(f"=== MEXC Signals @ {results['ts']} ===")
     print(f"Scanned — 1h:{len(scan_pairs_day)}  4h:{len(scan_pairs_swing)}  1d:{len(scan_pairs_trend)}  | watchlist:{len(base_pairs)}  movers:{len(movers_pairs)}")
     if results["movers"]["mexc"]:
         print("Movers (MEXC):", ", ".join(results["movers"]["mexc"]))
 
-    # Only print [SIGNAL] for actionable (i.e., not already open and not blocked by limits)
-    if actionable_signals:
-        for s in actionable_signals:
-            print(f"[SIGNAL] {s['symbol']} {s['timeframe']} — {s['type']} — {s['note']} | entry {s['entry']:.6f} stop {s['stop']:.6f} t1 {s.get('t1')} t2 {s.get('t2')}")
+    # Print executed only as [SIGNAL] (clean console), but everything is in Discord summary + signal_logs
+    if executed_signals:
+        for s in executed_signals:
+            print(f"[SIGNAL] {s['symbol']} {s['timeframe']} — {s['type']} — {s.get('note','')} | entry {s['entry']:.6f} stop {s['stop']:.6f} t1 {s.get('t1')} t2 {s.get('t2')}")
     else:
         print("No actionable signals.")
 
-    # ===== Paper performance snapshot (each run) =====
+    # Paper snapshot
     if paper_mode:
         paper_snapshot(client, rds, pf, perf)
+
+    # ===== Discord summary =====
+    dcfg = cfg.get("discord", {"enabled": False})
+    if dcfg.get("enabled"):
+        try:
+            ts = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            msg = build_discord_summary(ts, signal_logs=signal_logs, executed=executed_signals, sell_logs=sell_logs)
+            send_discord_message(dcfg.get("webhook_url") or os.environ.get("DISCORD_WEBHOOK_URL"), msg)
+            print("[discord] summary sent.")
+        except Exception as e:
+            print("[discord] error:", e)
 
 # ================== Entrypoint ==================
 if __name__ == "__main__":
