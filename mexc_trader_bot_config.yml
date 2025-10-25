@@ -45,7 +45,6 @@ day_trade_params:
   vol_sma: 30
   rsi_min: 52
   rsi_max: 78
-  btc_filter: true
   btc_symbol: "BTC/USDT"
   btc_ema: 20
   stop_mode: "swing"              # "swing" or "atr"
