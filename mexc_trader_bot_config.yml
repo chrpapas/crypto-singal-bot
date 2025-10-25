@@ -1,62 +1,76 @@
-# ================================
-# Persistence
-# ================================
-persistence:
-  redis_url:  "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"       # set in env
-  key_prefix: spideybot:v1
-  ttl_minutes: 2880               # 2 days TTL for edge memories
+# ===========================
+# MEXC Trader Bot – Config
+# Compatible with latest code (no btc_* keys in DayParams)
+# ===========================
 
-# ================================
-# Trading settings
-# ================================
+# NOTE: Discord webhooks are read from environment:
+#   DISCORD_SIGNALS_WEBHOOK="https://discord.com/api/webhooks/..."
+#   DISCORD_TRADES_WEBHOOK="https://discord.com/api/webhooks/..."
+# CoinMarketCap key (used for Top-100 & Movers):
+#   CMC_API_KEY="your_key"
+
+persistence:
+  backend: redis
+  key_prefix: spideybot:v1
+  ttl_minutes: 2880
+  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"   # e.g. rediss://...upstash.io:6379
+
 trading:
-  paper: true                     # paper mode on
+  paper: true
   base_balance_usdt: 1000
-  risk_per_trade_pct: 1.0         # 1% of equity per trade
+  risk_per_trade_pct: 1.0
   max_concurrent_positions: 10
   min_usdt_order: 10
-  live_market_slippage_bps: 10    # for live only
+  live_market_slippage_bps: 10
 
-# ================================
-# Bear-safe (inverse tokens for bearish)
-# ================================
-bear_mode:
+# --- Signal Scan Source (Top-100 by market cap) ---
+top100_scan:
   enabled: true
-  inverse_suffixes: ["3S","5S"]   # e.g., BTC3S/USDT, BTC5S/USDT
+  quote: USDT
+  cmc_api_key: ${CMC_API_KEY}
+  # Stablecoins excluded automatically in code; you can add overrides here if your build supports it:
+  exclude_symbols: ["USDT","USDC","FDUSD","TUSD","DAI","PAXG","XAUT","USD1","USDD","FUSD","FDUSD","PYUSD"]
 
-# ================================
-# Legacy Movers scan (separate from Top-100 signals scan)
-# - CMC filters; symbols then filtered to those listed on MEXC
-# - Anti-fakeout logic is in the bot (1h anchor + multi-TF + volume surge)
-# ================================
+# --- Legacy Movers (separate scan + legacy logic) ---
 movers:
   enabled: true
   limit: 500
-  min_change_24h: 15.0            # >= +15% 24h change
-  min_volume_usd_24h: 5000000     # >= $5M 24h volume
-  max_age_days: 365               # listed within the last year
+  min_change_24h: 15          # >= +15% on 24h
+  min_volume_usd_24h: 5000000 # >= $5M 24h volume
+  max_age_days: 365           # exclude very old assets if you prefer freshness
   quote: USDT
+  cmc_api_key: ${CMC_API_KEY}
+  # extra legacy filters used by the code’s movers logic:
+  ema_stack_confirm: true     # require EMA20>EMA50>EMA100 (bull trend)
+  rsi_min: 55                 # momentum floor
+  vol_sma_window: 20          # volume baseline window
+  anti_fakeout:
+    lookback_bars: 24         # must hold above breakout on multiple closes
+    require_two_closes_above: true
+    max_pullback_pct: 6       # avoid signals after over-extended spikes
+  exclude_symbols: ["USDT","USDC","FDUSD","TUSD","DAI","PAXG","XAUT","USD1","USDD","FUSD","FDUSD","PYUSD"]
 
-# ================================
-# Day trade parameters (used in Top-100 scan)
-# ================================
+# --- Supply/Demand zones (optional confluence) ---
+supply_demand:
+  enabled: false
+  mode: prefer          # prefer | require
+  timeframe_for_zones: 1h
+  lookback: 300
+  impulse_factor: 1.8
+  zone_padding_pct: 0.25
+  max_age_bars: 300
+
+# --- Day / Swing / Trend parameters ---
 day_trade_params:
   lookback_high: 30
   vol_sma: 30
   rsi_min: 52
   rsi_max: 78
-  btc_symbol: "BTC/USDT"
-  btc_ema: 20
-  stop_mode: "swing"              # "swing" or "atr"
+  stop_mode: swing      # swing | atr
   atr_mult: 1.5
-  early_reversal: {}              # keep for compatibility
-  multi_tf: {}                    # keep for compatibility
 
-# ================================
-# Swing trade parameters (Top-100 scan)
-# ================================
 swing_trade_params:
-  timeframe: "4h"
+  timeframe: 4h
   ema20: 20
   ema50: 50
   ema100: 100
@@ -65,12 +79,9 @@ swing_trade_params:
   rsi_max: 70
   vol_sma: 20
   breakout_lookback: 34
-  stop_mode: "swing"
-  atr_mult: 2.0
+  stop_mode: swing
+  atr_mult: 1.8
 
-# ================================
-# Trend trade parameters (Top-100 scan)
-# ================================
 trend_trade_params:
   ema20: 20
   ema50: 50
@@ -80,60 +91,85 @@ trend_trade_params:
   rsi_max: 70
   vol_sma: 20
   breakout_lookback: 55
-  stop_mode: "swing"
+  stop_mode: swing
   atr_mult: 2.0
 
-# ================================
-# Bearish detectors (feed bear-safe inverse longs if available)
-# ================================
+# --- Bear-safe / Bearish-to-inverse mapping (kept available) ---
+bear_mode:
+  enabled: true
+  inverse_suffixes: ["3S","5S"]
+
 bearish_signals:
   enabled: true
   day:
-    timeframe: "1h"
+    timeframe: 1h
     lookback_low: 20
     vol_sma: 20
-    rsi_max: 50
     require_breakdown: true
     require_vol_confirm: true
-  swing:
-    timeframe: "4h"
-    lookback_low: 34
     rsi_max: 50
+  swing:
+    timeframe: 4h
+    lookback_low: 34
     ema_stack_bear: true
     require_vol_confirm: true
-  trend:
-    timeframe: "1d"
-    lookback_low: 55
     rsi_max: 50
+  trend:
+    timeframe: 1d
+    lookback_low: 55
     ema20_below_50: true
+    rsi_max: 50
 
-# ================================
-# Supply/Demand zones
-# - Disabled by default; enable to require/avoid zones
-# ================================
-supply_demand:
-  enabled: false                  # set true to use zones
-  mode: "prefer"                  # "prefer" or "require" demand for longs
-  avoid_supply: true              # avoid taking longs into supply zones
-  timeframe_for_zones: "1h"
-  lookback: 300
-  impulse_factor: 1.8
-  zone_padding_pct: 0.25
-  max_age_bars: 300
-
-# ================================
-# Exit / performance (kept for compatibility)
-# ================================
+# --- Exit logic (edge-trigger & multi-TF optional) ---
 exits:
   enabled: true
+  edge_trigger: true
+  day:
+    ema_break: 20
+    rsi_drop_from: 70
+    rsi_drop_to: 60
+    macd_confirm: true
+    multi_tf:
+      enabled: true
+      confirm_tfs: ["5m","15m","30m"]
+      min_confirmations: 2
+      require_ema_bear: true
+      require_macd_bear: true
+      max_rsi: 50
+  swing:
+    ema_break: 50
+    rsi_below: 50
+    macd_confirm: true
+  trend:
+    ema_cross_20_50: true
+    rsi_below: 50
+    macd_confirm: true
 
+# --- Performance engine ---
 performance:
   enabled: true
+  # When simulating fills from historical bars:
+  assume_fills: next_close     # next_close | signal_close
+  tp_priority: target_first    # target_first | stop_first (if same bar)
+  max_bars_eval:
+    day: 180
+    swing: 180
+    trend: 320
+  use_exit_signals: true
 
-# ================================
-# Quality / confirmations (used by legacy movers logic)
-# ================================
+# --- Quality gates for signals ---
 quality:
-  min_avg_dollar_vol_1h: 200000         # liquidity gate (avg $ vol over last 24 1h bars)
-  signal_cooldown_bars: 6               # edge dedup (TTL via Redis)
-  require_two_closes_breakout: true     # for movers breakout confirmation
+  merge_tolerance_bps: 50        # for fuzzy-merge in logs
+  signal_cooldown_bars: 6        # per symbol/timeframe/type
+  min_avg_dollar_vol_1h: 200000  # liquidity floor from 1h data
+  require_two_closes_breakout: true
+  exclude_stablecoins: true
+  stablecoin_symbols: ["USDT","USDC","FDUSD","TUSD","DAI","PAXG","XAUT","USD1","USDD","FUSD","PYUSD"]
+
+# --- Discord (webhooks via ENV) ---
+# The code reads webhooks from env only:
+#   DISCORD_SIGNALS_WEBHOOK
+#   DISCORD_TRADES_WEBHOOK
+# If your build supports an enable flag, you can keep:
+discord:
+  enabled: true
