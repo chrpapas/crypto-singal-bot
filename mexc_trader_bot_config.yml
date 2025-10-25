@@ -2,7 +2,7 @@
 # Persistence
 # ================================
 persistence:
-  redis_url:  "rediss://default:AW1UAAIncDI4ODk3N2U4MDFhOTA0MmY4YjMxMTkyYmQwODBiYWI2MHAyMjc5ODg@central-possum-27988.upstash.io:6379"       # set in env
+  redis_url:  "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"       # set in env
   key_prefix: spideybot:v1
   ttl_minutes: 2880               # 2 days TTL for edge memories
 
