@@ -1,6 +1,6 @@
 # ========= Persistence =========
 persistence:
-  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
+  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"          # or paste your Upstash URL
   key_prefix: spideybot:v1
   ttl_minutes: 2880
 
@@ -15,7 +15,7 @@ trading:
 
 # ========= Filters =========
 filters:
-  extra_stables: []           # e.g. ["USDY","USDE"]
+  extra_stables: ["USDY","USDE"]  # add more if needed
 
 # ========= Supply/Demand (optional) =========
 supply_demand:
@@ -75,19 +75,11 @@ movers:
   min_volume_usd_24h: 5000000
   max_age_days: 365
   quote: USDT
-  cmc_api_key: ${CMC_API_KEY}
-
-# ========= Performance =========
-performance:
-  tp_priority: "target_first"
-  silent_max_bars:
-    day: 240
-    swing: 200
-    trend: 180
+  cmc_api_key: "${CMC_API_KEY}"
 
 # ========= Discord (webhooks also read from ENV) =========
 discord:
-  # Prefer setting environment variables:
+  # Prefer environment variables:
   #   DISCORD_SIGNALS_WEBHOOK and DISCORD_TRADES_WEBHOOK
-  signals_webhook: ""
-  trades_webhook: ""
+  signals_webhook: ""   # fallback if env missing
+  trades_webhook: ""    # fallback if env missing
