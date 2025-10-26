@@ -1,86 +1,59 @@
-# ===========================
-# MEXC Trader Bot – Config
-# Compatible with latest code (no btc_* keys in DayParams)
-# ===========================
-
-# NOTE: Discord webhooks are read from environment:
-#   DISCORD_SIGNALS_WEBHOOK="https://discord.com/api/webhooks/..."
-#   DISCORD_TRADES_WEBHOOK="https://discord.com/api/webhooks/..."
-# CoinMarketCap key (used for Top-100 & Movers):
-#   CMC_API_KEY="your_key"
-
+# ========= Persistence =========
 persistence:
-  backend: redis
+  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
   key_prefix: spideybot:v1
   ttl_minutes: 2880
-  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"   # e.g. rediss://...upstash.io:6379
 
+# ========= Trading =========
 trading:
-  paper: true
-  base_balance_usdt: 1000
+  paper: true                 # true=paper, false=live
+  base_balance_usdt: 1000     # for paper init
   risk_per_trade_pct: 1.0
   max_concurrent_positions: 10
   min_usdt_order: 10
   live_market_slippage_bps: 10
 
-# --- Signal Scan Source (Top-100 by market cap) ---
-top100_scan:
-  enabled: true
-  quote: USDT
-  cmc_api_key: ${CMC_API_KEY}
-  # Stablecoins excluded automatically in code; you can add overrides here if your build supports it:
-  exclude_symbols: ["USDT","USDC","FDUSD","TUSD","DAI","PAXG","XAUT","USD1","USDD","FUSD","FDUSD","PYUSD"]
+# ========= Filters =========
+filters:
+  extra_stables: []           # e.g. ["USDY","USDE"]
 
-# --- Legacy Movers (separate scan + legacy logic) ---
-movers:
-  enabled: true
-  limit: 500
-  min_change_24h: 15          # >= +15% on 24h
-  min_volume_usd_24h: 5000000 # >= $5M 24h volume
-  max_age_days: 365           # exclude very old assets if you prefer freshness
-  quote: USDT
-  cmc_api_key: ${CMC_API_KEY}
-  # extra legacy filters used by the code’s movers logic:
-  ema_stack_confirm: true     # require EMA20>EMA50>EMA100 (bull trend)
-  rsi_min: 55                 # momentum floor
-  vol_sma_window: 20          # volume baseline window
-  anti_fakeout:
-    lookback_bars: 24         # must hold above breakout on multiple closes
-    require_two_closes_above: true
-    max_pullback_pct: 6       # avoid signals after over-extended spikes
-  exclude_symbols: ["USDT","USDC","FDUSD","TUSD","DAI","PAXG","XAUT","USD1","USDD","FUSD","FDUSD","PYUSD"]
-
-# --- Supply/Demand zones (optional confluence) ---
+# ========= Supply/Demand (optional) =========
 supply_demand:
   enabled: false
-  mode: prefer          # prefer | require
-  timeframe_for_zones: 1h
+  timeframe_for_zones: "1h"
   lookback: 300
   impulse_factor: 1.8
   zone_padding_pct: 0.25
   max_age_bars: 300
+  mode: "prefer"              # "prefer" or "require"
 
-# --- Day / Swing / Trend parameters ---
+# ========= Day / Swing / Trend params =========
 day_trade_params:
   lookback_high: 30
   vol_sma: 30
   rsi_min: 52
   rsi_max: 78
-  stop_mode: swing      # swing | atr
   atr_mult: 1.5
+  stop_mode: "swing"
+  day_mtf:
+    enabled: true
+    confirm_tfs: ["5m","15m","30m","45m"]
+    min_confirmations: 2
+    require_ema_stack: true
+    require_macd_bull: true
+    min_rsi: 52
 
 swing_trade_params:
-  timeframe: 4h
+  timeframe: "4h"
   ema20: 20
   ema50: 50
   ema100: 100
   pullback_pct_max: 10.0
   rsi_min: 50
-  rsi_max: 70
   vol_sma: 20
   breakout_lookback: 34
-  stop_mode: swing
-  atr_mult: 1.8
+  stop_mode: "swing"
+  atr_mult: 2.0
 
 trend_trade_params:
   ema20: 20
@@ -91,85 +64,30 @@ trend_trade_params:
   rsi_max: 70
   vol_sma: 20
   breakout_lookback: 55
-  stop_mode: swing
+  stop_mode: "swing"
   atr_mult: 2.0
 
-# --- Bear-safe / Bearish-to-inverse mapping (kept available) ---
-bear_mode:
+# ========= Movers (legacy) =========
+movers:
   enabled: true
-  inverse_suffixes: ["3S","5S"]
+  limit: 500
+  min_change_24h: 15.0
+  min_volume_usd_24h: 5000000
+  max_age_days: 365
+  quote: USDT
+  cmc_api_key: ${CMC_API_KEY}
 
-bearish_signals:
-  enabled: true
-  day:
-    timeframe: 1h
-    lookback_low: 20
-    vol_sma: 20
-    require_breakdown: true
-    require_vol_confirm: true
-    rsi_max: 50
-  swing:
-    timeframe: 4h
-    lookback_low: 34
-    ema_stack_bear: true
-    require_vol_confirm: true
-    rsi_max: 50
-  trend:
-    timeframe: 1d
-    lookback_low: 55
-    ema20_below_50: true
-    rsi_max: 50
-
-# --- Exit logic (edge-trigger & multi-TF optional) ---
-exits:
-  enabled: true
-  edge_trigger: true
-  day:
-    ema_break: 20
-    rsi_drop_from: 70
-    rsi_drop_to: 60
-    macd_confirm: true
-    multi_tf:
-      enabled: true
-      confirm_tfs: ["5m","15m","30m"]
-      min_confirmations: 2
-      require_ema_bear: true
-      require_macd_bear: true
-      max_rsi: 50
-  swing:
-    ema_break: 50
-    rsi_below: 50
-    macd_confirm: true
-  trend:
-    ema_cross_20_50: true
-    rsi_below: 50
-    macd_confirm: true
-
-# --- Performance engine ---
+# ========= Performance =========
 performance:
-  enabled: true
-  # When simulating fills from historical bars:
-  assume_fills: next_close     # next_close | signal_close
-  tp_priority: target_first    # target_first | stop_first (if same bar)
-  max_bars_eval:
-    day: 180
-    swing: 180
-    trend: 320
-  use_exit_signals: true
+  tp_priority: "target_first"
+  silent_max_bars:
+    day: 240
+    swing: 200
+    trend: 180
 
-# --- Quality gates for signals ---
-quality:
-  merge_tolerance_bps: 50        # for fuzzy-merge in logs
-  signal_cooldown_bars: 6        # per symbol/timeframe/type
-  min_avg_dollar_vol_1h: 200000  # liquidity floor from 1h data
-  require_two_closes_breakout: true
-  exclude_stablecoins: true
-  stablecoin_symbols: ["USDT","USDC","FDUSD","TUSD","DAI","PAXG","XAUT","USD1","USDD","FUSD","PYUSD"]
-
-# --- Discord (webhooks via ENV) ---
-# The code reads webhooks from env only:
-#   DISCORD_SIGNALS_WEBHOOK
-#   DISCORD_TRADES_WEBHOOK
-# If your build supports an enable flag, you can keep:
+# ========= Discord (webhooks also read from ENV) =========
 discord:
-  enabled: true
+  # Prefer setting environment variables:
+  #   DISCORD_SIGNALS_WEBHOOK and DISCORD_TRADES_WEBHOOK
+  signals_webhook: ""
+  trades_webhook: ""
