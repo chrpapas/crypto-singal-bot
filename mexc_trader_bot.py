@@ -490,8 +490,26 @@ def run(cfg: Dict[str,Any]):
     # Universe — Top100 & Movers
     top100_syms = cmc_top100_symbols(cfg)
     top100_pairs = filter_pairs_on_mexc(client, top100_syms, "USDT", extra_stables)
+    log_universe_stats("Top100", top100_syms, top100_pairs)
+    
     movers_syms = cmc_movers_symbols(cfg) if mv_cfg.get("enabled", True) else []
     movers_pairs = filter_pairs_on_mexc(client, movers_syms, mv_cfg.get("quote","USDT"), extra_stables)
+    log_universe_stats("Movers(CMC)", movers_syms, movers_pairs)
+    
+    # Fallbacks if empty/too small
+    fb_cfg = cfg.get("fallback", {"enabled": True, "min_pairs": 30, "min_usd_vol": 2_000_000, "max_pairs": 60})
+    if fb_cfg.get("enabled", True):
+        if len(top100_pairs) < int(fb_cfg.get("min_pairs", 30)):
+            top100_pairs = mexc_top_usdt_volume_pairs(
+                client,
+                max_pairs=int(fb_cfg.get("max_pairs", 60)),
+                min_usd_vol=float(fb_cfg.get("min_usd_vol", 2_000_000)),
+                extra_stables=extra_stables
+            )
+            print(f"[universe] Top100 fallback -> using MEXC volume universe ({len(top100_pairs)} pairs)")
+        if mv_cfg.get("enabled", True) and len(movers_pairs) == 0:
+            movers_pairs = top100_pairs[:]   # reuse volume universe for movers if CMC list empty
+            print("[universe] Movers fallback -> reusing MEXC volume universe")
 
     # Zones cache (optional)
     zones_cache = {}
@@ -692,6 +710,43 @@ def run(cfg: Dict[str,Any]):
         print(f"Equity:    {equity:.2f} USDT  | Unrealized PnL: {pnl_total:+.2f} USDT")
         print("--- End Snapshot ---")
 
+
+# --- DIAGNOSTICS ---
+def log_universe_stats(label, raw_syms, mexc_pairs):
+    print(f"[universe] {label}: CMC syms={len(raw_syms)} -> MEXC tradable (ex-stables)={len(mexc_pairs)}")
+
+# --- MEXC FALLBACK UNIVERSE (Top USDT-volume spot pairs) ---
+def mexc_top_usdt_volume_pairs(client: ExClient, *, max_pairs=60, min_usd_vol=2_000_000, extra_stables=None):
+    extra_stables = extra_stables or []
+    try:
+        tickers = client.ex.fetch_tickers()
+    except Exception as e:
+        print("[fallback] fetch_tickers err:", e)
+        return []
+    items = []
+    for sym, t in tickers.items():
+        if "/USDT" not in sym:
+            continue
+        if is_stable_or_pegged(sym, extra_stables):
+            continue
+        qv = t.get("quoteVolume")
+        if qv is None:
+            base_v = t.get("baseVolume")
+            last = t.get("last") or t.get("close")
+            try:
+                qv = (base_v or 0) * (last or 0)
+            except Exception:
+                qv = 0
+        try:
+            qv = float(qv or 0)
+        except Exception:
+            qv = 0.0
+        if qv >= float(min_usd_vol):
+            items.append((sym, qv))
+    items.sort(key=lambda x: x[1], reverse=True)
+    pairs = [s for s,_ in items[:max_pairs]]
+    print(f"[fallback] MEXC top USDT-volume picked {len(pairs)} pairs (min_usd_vol={min_usd_vol})")
+    return pairs
 # =============== Entrypoint ===============
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
