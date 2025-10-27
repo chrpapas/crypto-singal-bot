@@ -156,10 +156,12 @@ DEFAULT_STABLES = {
     "USDT","USDC","USDD","DAI","FDUSD","TUSD","BUSD","PAX","PAXG","XAUT","USD1","USDE","USDY",
     "USDP","SUSD","EURS","EURT","PYUSD"
 }
+# AFTER (good): only filters if the BASE is a stable/pegged token
 def is_stable_or_pegged(symbol: str, extra: List[str]) -> bool:
-    base, quote = symbol.split("/")
-    b = base.replace("3L","").replace("3S","").replace("5L","").replace("5S","")
-    return (b in DEFAULT_STABLES) or (b in (extra or [])) or (quote in DEFAULT_STABLES)
+    base, _ = symbol.split("/")
+    b = base.upper().replace("3L","").replace("3S","").replace("5L","").replace("5S","")
+    extras = {e.upper() for e in (extra or [])}
+    return (b in DEFAULT_STABLES) or (b in extras)
 
 # =============== Bullish Signals ===============
 def day_signal(df: pd.DataFrame, p: DayParams, sd_cfg: Dict[str,Any], zones=None):
