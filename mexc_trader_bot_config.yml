@@ -1,6 +1,6 @@
 # ========= Persistence =========
 persistence:
-  redis_url: "REDIS_URL="rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
+  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
   key_prefix: spideybot:v1
   ttl_minutes: 2880
 
