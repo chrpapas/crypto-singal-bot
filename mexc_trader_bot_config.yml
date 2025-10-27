@@ -1,27 +1,21 @@
 # ========= Persistence =========
 persistence:
-  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"   # or use REDIS_URL en
+  redis_url: "REDIS_URL="rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
   key_prefix: spideybot:v1
   ttl_minutes: 2880
 
 # ========= Trading =========
 trading:
-  paper: true                 # true=paper, false=live
-  base_balance_usdt: 1000     # for paper init
+  paper: true
+  base_balance_usdt: 1000
   risk_per_trade_pct: 1.0
   max_concurrent_positions: 10
   min_usdt_order: 10
   live_market_slippage_bps: 10
 
-# ========= Futures (stub for later enablement) =========
-futures:
-  enabled: false              # when true: we still route bear-safe to spot inverse until perp support is finalized
-  market: "USDT"              # future use
-  use_cross: false            # future use
-
 # ========= Filters =========
 filters:
-  extra_stables: ["USDY","USDE"]  # add more if needed
+  extra_stables: ["USDY","USDE","FDUSD","PAXG","XAUT"]  # extend as needed
 
 # ========= Supply/Demand (optional) =========
 supply_demand:
@@ -33,7 +27,7 @@ supply_demand:
   max_age_bars: 300
   mode: "prefer"              # "prefer" or "require"
 
-# ========= Day / Swing / Trend (bullish) =========
+# ========= Day / Swing / Trend params =========
 day_trade_params:
   lookback_high: 30
   vol_sma: 30
@@ -73,16 +67,22 @@ trend_trade_params:
   stop_mode: "swing"
   atr_mult: 2.0
 
-# ========= Bearish -> Inverse (bear-safe) =========
-bear_mode:
+# ========= Movers (legacy) =========
+movers:
   enabled: true
-  inverse_suffixes: ["3S","5S"]  # try BASE3S/USDT, BASE5S/USDT, etc.
+  limit: 500
+  min_change_24h: 15.0
+  min_volume_usd_24h: 5000000
+  max_age_days: 365
+  quote: USDT
+  cmc_api_key: "${CMC_API_KEY}"
 
+# ========= Bearish detectors + inverse mapping =========
 bearish_signals:
   enabled: true
   day:
     timeframe: "1h"
-    lookback_low: 20
+    lookback_low: 30
     vol_sma: 20
     require_breakdown: true
     require_vol_confirm: true
@@ -99,19 +99,22 @@ bearish_signals:
     ema20_below_50: true
     rsi_max: 50
 
-# ========= Movers (legacy) =========
-movers:
+bear_mode:
   enabled: true
-  limit: 500
-  min_change_24h: 15.0
-  min_volume_usd_24h: 5000000
-  max_age_days: 365
-  quote: USDT
-  cmc_api_key: "${CMC_API_KEY}"
+  inverse_suffixes: ["3S","5S"]   # try BASE3S/USDT, then BASE5S/USDT
+
+# ========= Futures (stub for later live perps) =========
+futures:
+  enabled: false
+
+# ========= Fallback universe (diagnostics + liquidity-based backup) =========
+fallback:
+  enabled: true
+  min_pairs: 30
+  min_usd_vol: 2000000
+  max_pairs: 60
 
 # ========= Discord (webhooks also read from ENV) =========
 discord:
-  # Prefer env vars:
-  #   DISCORD_SIGNALS_WEBHOOK and DISCORD_TRADES_WEBHOOK
-  signals_webhook: ""   # fallback if env missing
-  trades_webhook: ""    # fallback if env missing
+  signals_webhook: ""   # prefer env DISCORD_SIGNALS_WEBHOOK
+  trades_webhook: ""    # prefer env DISCORD_TRADES_WEBHOOK
