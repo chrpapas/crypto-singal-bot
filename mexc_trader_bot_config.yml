@@ -19,7 +19,7 @@ filters:
 
 # ========= Supply/Demand (optional) =========
 supply_demand:
-  enabled: false
+  enabled: true
   timeframe_for_zones: "1h"
   lookback: 300
   impulse_factor: 1.8
