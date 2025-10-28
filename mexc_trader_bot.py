@@ -2,26 +2,33 @@
 # -*- coding: utf-8 -*-
 
 """
-mexc_trader_bot.py — MEXC spot-only scanner/trader with:
-- Top-100-by-marketcap scan (signals)
-- Legacy Movers scan (signals)
-- Bear-safe inverse flow (bearish detectors -> long inverse 3S/5S tokens on MEXC spot)
-- Multi-timeframe confirm for day signals (5m/15m/30m/45m)
-- Stablecoin/pegged filtering
-- Silent-signal registry (no duplicate setups until closed by t1/stop/timeout)
-- Paper/live execution with risk sizing and max-open guard
-- Discord: Signals (Top100 + Movers + Bear-Safe to the same hook) and Trades (only if an actual trade executed)
-- Performance snapshot for paper and silent-signal dashboard printed to logs (not sent to Discord)
+mexc_trader_bot.py — MEXC spot scanner/trader
 
-Environment (optional):
+Universes
+- Top-100 by market cap (CMC) -> mapped to MEXC /USDT (excluding stable/pegged BASE symbols)
+- Movers (legacy 24h % + volume) -> mapped to MEXC
+- Fallback: top USDT-volume MEXC spot pairs when mapping is small
+
+Signals
+- Bullish: day(1h)/swing(4h)/trend(1d) + optional SD zone preference + day MTF confirmation
+- Bearish: day(1h)/swing(4h)/trend(1d) (always scanned)
+- ETH Market Gate: gates *bullish* Top-100 emissions by ETH regime (1h/4h/1d)
+
+Execution
+- Paper/Live buy for bullish signals as before
+- Bear-safe: for bearish signals, attempt to BUY inverse spot levered token (3S/5S). Signals are still posted for the base even if no inverse exists. No shorting.
+- Silent-signal registry to avoid duplicates until T1/Stop/timeout close eval
+
+Discord
+- Signals (Top100, Movers, Bearish)
+- Trades (only if executed)
+
+ENV (optional):
   REDIS_URL, DISCORD_SIGNALS_WEBHOOK, DISCORD_TRADES_WEBHOOK, CMC_API_KEY,
   MEXC_API_KEY, MEXC_SECRET
-
-Run:
-  python3 mexc_trader_bot.py --config mexc_trader_bot_config.yml
 """
 
-import argparse, json, os, sys, yaml, requests, math
+import argparse, json, os, yaml, requests, math
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
@@ -29,7 +36,7 @@ import numpy as np
 import ccxt
 import redis
 
-# =============== TA helpers ===============
+# ================== TA helpers ==================
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
 def sma(s: pd.Series, n: int) -> pd.Series: return s.rolling(n).mean()
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -42,7 +49,7 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
     f = ema(series, fast); s = ema(series, slow); line = f - s; sig = line.ewm(span=signal, adjust=False).mean()
     hist = line - sig; return line, sig, hist
 
-# =============== Exchange wrapper (MEXC) ===============
+# ================== Exchange wrapper (MEXC only) ==================
 class ExClient:
     def __init__(self):
         self.name = "mexc"
@@ -82,7 +89,7 @@ class ExClient:
     def place_market(self, symbol: str, side: str, amount: float) -> dict:
         return self.ex.create_order(symbol, type="market", side=side, amount=amount)
 
-# =============== Dataclasses (only used keys) ===============
+# ================== Params ==================
 @dataclass
 class DayParams:
     lookback_high: int = 30
@@ -106,7 +113,7 @@ class TrendParams:
     stop_mode: str = "swing"
     atr_mult: float = 2.0
 
-# =============== Redis persistence ===============
+# ================== Redis persistence ==================
 class RedisState:
     def __init__(self, url: str, prefix: str, ttl_minutes: int):
         if not url: raise RuntimeError("Redis URL missing. Provide persistence.redis_url or REDIS_URL.")
@@ -126,7 +133,7 @@ class RedisState:
         except Exception: return default if default is not None else {}
     def save_json(self, obj, *parts): self.set(json.dumps(obj), *parts)
 
-# =============== SD zones / helpers ===============
+# ================== SD zones / helpers ==================
 def body(df: pd.DataFrame) -> pd.Series: return (df['close'] - df['open']).abs()
 def avg_range(df: pd.DataFrame, n: int = 20) -> pd.Series: return (df['high'] - df['low']).rolling(n).mean()
 def find_zones(df: pd.DataFrame, impulse_factor=1.8, zone_padding_pct=0.25, max_age_bars=300):
@@ -151,19 +158,18 @@ def stop_from(df: pd.DataFrame, mode: str, atr_mult: float) -> float:
         return float(df["close"].iloc[-1] - atr_mult * a)
     return float(min(df["low"].iloc[-10:]))
 
-# =============== Stablecoin filtering ===============
+# ================== Stable/pegged filtering (BASE only) ==================
 DEFAULT_STABLES = {
     "USDT","USDC","USDD","DAI","FDUSD","TUSD","BUSD","PAX","PAXG","XAUT","USD1","USDE","USDY",
     "USDP","SUSD","EURS","EURT","PYUSD"
 }
-# AFTER (good): only filters if the BASE is a stable/pegged token
 def is_stable_or_pegged(symbol: str, extra: List[str]) -> bool:
     base, _ = symbol.split("/")
     b = base.upper().replace("3L","").replace("3S","").replace("5L","").replace("5S","")
     extras = {e.upper() for e in (extra or [])}
     return (b in DEFAULT_STABLES) or (b in extras)
 
-# =============== Bullish Signals ===============
+# ================== Bullish Signals ==================
 def day_signal(df: pd.DataFrame, p: DayParams, sd_cfg: Dict[str,Any], zones=None):
     look, voln = p.lookback_high, p.vol_sma
     if len(df) < max(look, voln)+5: return None
@@ -215,7 +221,7 @@ def trend_signal(df: pd.DataFrame, p: TrendParams, sd_cfg: Dict[str,Any], zones=
     return {"type":"trend","entry":entry,"stop":stop,"t1":round(entry*1.08,6),"t2":round(entry*1.20,6),
             "level":float(hl),"note":"Pullback-Bounce" if (within and bounce) else "Breakout"}
 
-# =============== Multi-TF confirm helper ===============
+# ================== Multi-TF confirm (bullish day) ==================
 def tf_bull_ok(df: pd.DataFrame, *, require_ema_stack=True, require_macd_bull=True, min_rsi=50) -> bool:
     if df is None or len(df) < 60: return False
     e20 = ema(df['close'], 20); e50 = ema(df['close'], 50)
@@ -226,7 +232,48 @@ def tf_bull_ok(df: pd.DataFrame, *, require_ema_stack=True, require_macd_bull=Tr
     ok &= (r.iloc[-1] >= min_rsi)
     return bool(ok)
 
-# =============== Legacy Movers universe (CMC) ===============
+# ================== ETH Market Gate (for bullish Top-100) ==================
+def recent_swing_high(df: pd.DataFrame, lookback: int = 34) -> float:
+    if df is None or len(df) < lookback + 5: return float('nan')
+    return float(df['high'].iloc[-(lookback+1):-1].max())
+
+def near_resistance(df: pd.DataFrame, *, pct: float, lookback: int) -> bool:
+    if df is None or len(df) < lookback + 5: return False
+    last = df.iloc[-1]
+    hi = recent_swing_high(df, lookback)
+    if not np.isfinite(hi) or hi <= 0: return False
+    dist = (hi - float(last['close'])) / hi * 100.0
+    return 0.0 <= dist <= pct
+
+def regime_from_df(df: pd.DataFrame, *, rsi_min_on: int, near_res: bool) -> str:
+    if df is None or len(df) < 60: return "NEUTRAL"
+    e20, e50 = ema(df['close'], 20), ema(df['close'], 50)
+    r = rsi(df['close'], 14)
+    bull = (e20.iloc[-1] > e50.iloc[-1]) and (r.iloc[-1] >= rsi_min_on)
+    bear = (e20.iloc[-1] < e50.iloc[-1]) or (r.iloc[-1] < (rsi_min_on - 2))
+    if bull and not near_res: return "ON"
+    if bear or near_res: return "OFF"
+    return "NEUTRAL"
+
+def eth_market_regime(client: ExClient, gate_cfg: Dict[str,Any]) -> Dict[str,str]:
+    if not gate_cfg.get("enabled", True):
+        return {"1h":"ON","4h":"ON","1d":"ON","note":"gate disabled"}
+    sym = gate_cfg.get("eth_symbol","ETH/USDT")
+    near_pct = float(gate_cfg.get("near_res_pct", 2.0))
+    look = int(gate_cfg.get("swing_high_lookback", 34))
+    rsi_on = int(gate_cfg.get("rsi_min_on", 50))
+    reg = {}
+    tfs = [gate_cfg.get("fast_tf","1h"), gate_cfg.get("slow_tf","4h"), gate_cfg.get("trend_tf","1d")]
+    for tf in tfs:
+        try:
+            df = client.ohlcv(sym, tf, 300 if tf!="1d" else 320)
+            near = near_resistance(df, pct=near_pct, lookback=look)
+            reg[tf] = regime_from_df(df, rsi_min_on=rsi_on, near_res=near)
+        except Exception:
+            reg[tf] = "NEUTRAL"
+    return reg
+
+# ================== Legacy Movers (CMC) ==================
 def fetch_cmc_listings(cfg: Dict[str,Any], limit=500) -> List[dict]:
     headers = {"X-CMC_PRO_API_KEY": os.environ.get("CMC_API_KEY") or cfg.get("movers",{}).get("cmc_api_key","")}
     if not headers["X-CMC_PRO_API_KEY"]: return []
@@ -264,7 +311,7 @@ def filter_pairs_on_mexc(client: ExClient, symbols: List[str], quote: str="USDT"
             out.append(pair)
     return out
 
-# =============== Legacy movers signal (fakeout-resistant) ===============
+# ================== Legacy mover entry (conservative) ==================
 def legacy_mover_signal(df1h: pd.DataFrame, sd_cfg: Dict[str,Any]) -> Optional[Dict[str,Any]]:
     if df1h is None or len(df1h) < 80: return None
     e20, e50 = ema(df1h["close"],20), ema(df1h["close"],50)
@@ -279,7 +326,7 @@ def legacy_mover_signal(df1h: pd.DataFrame, sd_cfg: Dict[str,Any]) -> Optional[D
     return {"type":"day","entry":entry,"stop":stop,"t1":round(entry*1.05,6),"t2":round(entry*1.10,6),
             "level": float(hl), "note": "Mover Trend", "event_bar_ts": df1h.index[-1].isoformat()}
 
-# =============== Bearish detectors + inverse mapping ===============
+# ================== Bearish detectors + inverse mapping ==================
 def day_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any]) -> Optional[Dict[str,Any]]:
     tf_cfg = cfg.get("day", {})
     look = int(tf_cfg.get("lookback_low", 20)); voln = int(tf_cfg.get("vol_sma", 20))
@@ -321,16 +368,13 @@ def trend_bearish_signal(df: pd.DataFrame, cfg: Dict[str,Any]) -> Optional[Dict[
             "level":float(lowlvl),"note":"Bearish trend breakdown 1d","event_bar_ts": df.index[-1].isoformat()}
 
 def map_bearish_to_inverse_token(client: ExClient, pair: str, suffixes: List[str]) -> Optional[str]:
-    """
-    For BASE/USDT, try BASE3S/USDT, BASE5S/USDT, etc. (MEXC spot leveraged tokens)
-    """
     base, quote = pair.split("/")
     for suf in suffixes or []:
         alt = f"{base}{suf}/{quote}"
         if client.has_pair(alt): return alt
     return None
 
-# =============== Silent signal registry ===============
+# ================== Silent signal registry ==================
 def silent_key(symbol: str, tf: str, typ: str, source: str) -> str:
     return f"{symbol}|{tf}|{typ}|{source}"
 
@@ -339,7 +383,7 @@ def record_new_silent(rds: RedisState, sig: Dict[str,Any], source: str):
     k = silent_key(sig["symbol"], sig["timeframe"], sig["type"], source)
     book[k] = {
         "symbol": sig["symbol"], "tf": sig["timeframe"], "type": sig["type"], "source": source,
-        "entry": float(sig["entry"]), "stop": float(sig["stop"]),
+        "entry": float(sig["entry"]), "stop": float(sig["stop"]) if sig.get("stop") is not None else None,
         "t1": float(sig.get("t1")) if sig.get("t1") is not None else None,
         "t2": float(sig.get("t2")) if sig.get("t2") is not None else None,
         "opened_at": sig.get("event_bar_ts"),
@@ -357,7 +401,7 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
     changed = False
     for k, tr in list(book.items()):
         if tr.get("status")!="open": continue
-        pair = tr["symbol"]; tf = tr["tf"]; stop = tr["stop"]; t1 = tr.get("t1")
+        pair = tr["symbol"]; tf = tr["tf"]; stop = tr.get("stop"); t1 = tr.get("t1")
         try:
             limit = 400 if tf in ("1h","4h") else 330
             df = client.ohlcv(pair, tf, limit)
@@ -367,11 +411,11 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
             outcome=None; price=None
             for _,r in rows.iterrows():
                 lo, hi = float(r["low"]), float(r["high"])
-                if (lo <= stop) and (t1 is not None and hi >= t1):
+                if stop is not None and (lo <= stop) and (t1 is not None and hi >= t1):
                     if hi >= t1: outcome, price = "t1", t1
                     else: outcome, price = "stop", stop
                     break
-                if lo <= stop:
+                if stop is not None and lo <= stop:
                     outcome, price = "stop", stop; break
                 if t1 is not None and hi >= t1:
                     outcome, price = "t1", t1; break
@@ -385,7 +429,8 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
 
 def silent_dashboard(rds: RedisState):
     book = rds.load_json("state","silent_open", default={})
-    by = {"day": {"open":0,"closed":0,"wins":0}, "swing":{"open":0,"closed":0,"wins":0}, "trend":{"open":0,"closed":0,"wins":0}, "mover":{"open":0,"closed":0,"wins":0}, "bear":{"open":0,"closed":0,"wins":0}}
+    by = {"day": {"open":0,"closed":0,"wins":0}, "swing":{"open":0,"closed":0,"wins":0}, "trend":{"open":0,"closed":0,"wins":0},
+          "mover":{"open":0,"closed":0,"wins":0}, "bear":{"open":0,"closed":0,"wins":0}}
     for tr in book.values():
         src = tr.get("source","top100")
         bucket = "mover" if src=="movers" else ("bear" if src=="bear" else tr.get("type","day"))
@@ -394,13 +439,13 @@ def silent_dashboard(rds: RedisState):
             by[bucket]["closed"] += 1
             if tr.get("outcome")=="t1": by[bucket]["wins"] += 1
     print("--- Silent Signal Performance (since reset) ---")
-    def line(name,k): 
+    def line(name,k):
         o=by[k]["open"]; c=by[k]["closed"]; w=by[k]["wins"]; winp=(w/max(1,c))*100.0 if c>0 else 0.0
         print(f"{name:6}: closed {c} | open {o} | win% {winp:.1f}%")
     line("Day","day"); line("Swing","swing"); line("Trend","trend"); line("Mover","mover"); line("Bear","bear")
     print("--- End Silent Performance ---")
 
-# =============== Paper portfolio + trades ===============
+# ================== Paper portfolio + trades ==================
 def ensure_portfolio(rds: RedisState, trading_cfg: Dict[str,Any]) -> Dict[str,Any]:
     pf = rds.load_json("state","portfolio", default={})
     if not pf:
@@ -427,7 +472,7 @@ def paper_buy(rds: RedisState, pf: Dict[str,Any], symbol: str, price: float, qty
     rds.save_json(pf, "state","portfolio")
     return True
 
-# =============== Discord helpers ===============
+# ================== Discord helpers ==================
 def _post_discord(hook: str, text: str):
     if not hook or not text.strip(): return
     try: requests.post(hook, json={"content": text}, timeout=10)
@@ -439,15 +484,44 @@ def fmt_signal_lines(title: str, sigs: List[Dict[str,Any]]) -> str:
     for s in sigs:
         lines.append(
             f"• `{s['symbol']}` {s['timeframe']} *{s['type']}* — {s['note']}\n"
-            f"  entry `{s['entry']:.6f}` stop `{s['stop']:.6f}` t1 `{s.get('t1')}` t2 `{s.get('t2')}`"
+            f"  entry `{s['entry']:.6f}` stop `{s.get('stop') if s.get('stop') is not None else '—'}` t1 `{s.get('t1')}` t2 `{s.get('t2')}`"
         )
     return "\n".join(lines)
 
 def fmt_trade_lines(trades: List[str]) -> str:
     if not trades: return ""
-    return "**Trades**\n" + "\n".join(trades)
+    return "💼 **Trades**\n" + "\n".join(trades)
 
-# =============== RUN ===============
+# ================== Fallback universe by MEXC volume ==================
+def mexc_top_usdt_volume_pairs(client: ExClient, *, max_pairs=60, min_usd_vol=2_000_000, extra_stables=None):
+    extra_stables = extra_stables or []
+    try:
+        tickers = client.ex.fetch_tickers()
+    except Exception as e:
+        print("[fallback] fetch_tickers err:", e)
+        return []
+    items = []
+    for sym, t in tickers.items():
+        if "/USDT" not in sym: continue
+        if is_stable_or_pegged(sym, extra_stables): continue
+        qv = t.get("quoteVolume")
+        if qv is None:
+            base_v = t.get("baseVolume"); last = t.get("last") or t.get("close")
+            try: qv = (base_v or 0) * (last or 0)
+            except Exception: qv = 0
+        try: qv = float(qv or 0)
+        except Exception: qv = 0.0
+        if qv >= float(min_usd_vol): items.append((sym, qv))
+    items.sort(key=lambda x: x[1], reverse=True)
+    pairs = [s for s,_ in items[:max_pairs]]
+    print(f"[fallback] MEXC top USDT-volume picked {len(pairs)} pairs (min_usd_vol={min_usd_vol})")
+    return pairs
+
+# ================== Diagnostics ==================
+def log_universe_stats(label, raw_syms, mexc_pairs):
+    print(f"[universe] {label}: CMC syms={len(raw_syms)} -> MEXC tradable (ex-stables)={len(mexc_pairs)}")
+
+# ================== RUN ==================
 def run(cfg: Dict[str,Any]):
     client = ExClient()
     rds = RedisState(
@@ -477,13 +551,12 @@ def run(cfg: Dict[str,Any]):
     sd_cfg = cfg.get("supply_demand", {"enabled": False})
     mv_cfg = cfg.get("movers", {"enabled": True})
     bear_cfg = cfg.get("bearish_signals", {"enabled": True})
-    bear_mode = cfg.get("bear_mode", {"enabled": True})
+    bear_mode = cfg.get("bear_mode", {"enabled": True, "inverse_suffixes": ["3S","5S"]})
     inv_suffix = bear_mode.get("inverse_suffixes", ["3S","5S"])
-
-    # Futures toggle (stub for later)
-    fut_cfg = cfg.get("futures", {"enabled": False})
-    if fut_cfg.get("enabled"):
-        print("[futures] Perp futures enabled in config — execution currently stubbed; spot inverse tokens are used for bear-safe flow.")
+    gate_cfg = cfg.get("market_gate", {
+        "enabled": True, "eth_symbol":"ETH/USDT", "fast_tf":"1h", "slow_tf":"4h", "trend_tf":"1d",
+        "rsi_min_on":50, "near_res_pct":2.0, "swing_high_lookback":34, "require_neutral_extra_confirmations":1
+    })
 
     # State
     positions = rds.load_json("state","active_positions", default={})
@@ -493,12 +566,12 @@ def run(cfg: Dict[str,Any]):
     top100_syms = cmc_top100_symbols(cfg)
     top100_pairs = filter_pairs_on_mexc(client, top100_syms, "USDT", extra_stables)
     log_universe_stats("Top100", top100_syms, top100_pairs)
-    
+
     movers_syms = cmc_movers_symbols(cfg) if mv_cfg.get("enabled", True) else []
     movers_pairs = filter_pairs_on_mexc(client, movers_syms, mv_cfg.get("quote","USDT"), extra_stables)
     log_universe_stats("Movers(CMC)", movers_syms, movers_pairs)
-    
-    # Fallbacks if empty/too small
+
+    # Fallbacks
     fb_cfg = cfg.get("fallback", {"enabled": True, "min_pairs": 30, "min_usd_vol": 2_000_000, "max_pairs": 60})
     if fb_cfg.get("enabled", True):
         if len(top100_pairs) < int(fb_cfg.get("min_pairs", 30)):
@@ -510,8 +583,15 @@ def run(cfg: Dict[str,Any]):
             )
             print(f"[universe] Top100 fallback -> using MEXC volume universe ({len(top100_pairs)} pairs)")
         if mv_cfg.get("enabled", True) and len(movers_pairs) == 0:
-            movers_pairs = top100_pairs[:]   # reuse volume universe for movers if CMC list empty
+            movers_pairs = top100_pairs[:]
             print("[universe] Movers fallback -> reusing MEXC volume universe")
+
+    # ETH Market Gate
+    regimes = eth_market_regime(client, gate_cfg)
+    reg_fast = regimes.get(gate_cfg.get("fast_tf","1h"), "NEUTRAL")
+    reg_slow = regimes.get(gate_cfg.get("slow_tf","4h"), "NEUTRAL")
+    reg_daily = regimes.get(gate_cfg.get("trend_tf","1d"), "NEUTRAL")
+    print(f"[gate] ETH regimes -> {gate_cfg.get('fast_tf','1h')}:{reg_fast}  {gate_cfg.get('slow_tf','4h')}:{reg_slow}  {gate_cfg.get('trend_tf','1d')}:{reg_daily}")
 
     # Zones cache (optional)
     zones_cache = {}
@@ -528,62 +608,67 @@ def run(cfg: Dict[str,Any]):
 
     results_top100: List[Dict[str,Any]] = []
     results_movers: List[Dict[str,Any]] = []
-    results_bear:   List[Dict[str,Any]] = []
+    results_bearish_report: List[Dict[str,Any]] = []  # for Discord/reporting (base pairs)
     trade_lines: List[str] = []
 
-    # ======== Top-100 Scan (bullish) ========
+    # ======== Top-100 Scan (bullish, gated by ETH) ========
     # DAY (1h)
-    for pair in top100_pairs:
-        try:
-            df = client.ohlcv(pair, "1h", 300)
-            zones = zones_cache.get(pair)
-            sig = day_signal(df, dayP, sd_cfg, zones)
-            if sig and (dayP.day_mtf or {}).get("enabled", True):
-                mtf = dayP.day_mtf or {}
-                tfs = mtf.get("confirm_tfs", ["5m","15m","30m","45m"])
-                need = int(mtf.get("min_confirmations", 2))
-                ok = 0
-                for tf in tfs:
-                    try:
-                        df_tf = client.ohlcv(pair, tf, 200)
-                        if tf_bull_ok(df_tf,
-                                      require_ema_stack=mtf.get("require_ema_stack", True),
-                                      require_macd_bull=mtf.get("require_macd_bull", True),
-                                      min_rsi=mtf.get("min_rsi", 52)):
-                            ok += 1
-                    except Exception:
-                        pass
-                if ok < need: sig=None
-            if sig:
-                sig.update({"symbol":pair,"timeframe":"1h","exchange":"mexc"})
-                if not is_silent_open(rds, pair, "1h", sig["type"], "top100"):
-                    results_top100.append(sig); record_new_silent(rds, sig, "top100")
-        except Exception as e: print(f"[scan-top100-day] {pair} err:", e)
+    allow_day = (reg_fast == "ON") or (reg_fast == "NEUTRAL" and (dayP.day_mtf or {}).get("enabled", True))
+    extra_need = int(gate_cfg.get("require_neutral_extra_confirmations", 1)) if reg_fast == "NEUTRAL" else 0
+    if allow_day:
+        for pair in top100_pairs:
+            try:
+                df = client.ohlcv(pair, "1h", 300)
+                zones = zones_cache.get(pair)
+                sig = day_signal(df, dayP, sd_cfg, zones)
+                # day MTF confirm (+ extra when neutral)
+                if sig and (dayP.day_mtf or {}).get("enabled", True):
+                    mtf = dayP.day_mtf or {}
+                    tfs = mtf.get("confirm_tfs", ["5m","15m","30m","45m"])
+                    need = int(mtf.get("min_confirmations", 2)) + extra_need
+                    ok = 0
+                    for tf in tfs:
+                        try:
+                            df_tf = client.ohlcv(pair, tf, 200)
+                            if tf_bull_ok(df_tf,
+                                          require_ema_stack=mtf.get("require_ema_stack", True),
+                                          require_macd_bull=mtf.get("require_macd_bull", True),
+                                          min_rsi=mtf.get("min_rsi", 52)):
+                                ok += 1
+                        except Exception: ...
+                    if ok < need: sig=None
+                if sig:
+                    sig.update({"symbol":pair,"timeframe":"1h","exchange":"mexc"})
+                    if not is_silent_open(rds, pair, "1h", sig["type"], "top100"):
+                        results_top100.append(sig); record_new_silent(rds, sig, "top100")
+            except Exception as e: print(f"[scan-top100-day] {pair} err:", e)
 
     # SWING (4h)
-    tf_swing = swingP.get("timeframe","4h")
-    for pair in top100_pairs:
-        try:
-            df4h = client.ohlcv(pair, tf_swing, 400)
-            zones = zones_cache.get(pair)
-            sig = swing_signal(df4h, swingP, sd_cfg, zones)
-            if sig:
-                sig.update({"symbol":pair,"timeframe":tf_swing,"exchange":"mexc"})
-                if not is_silent_open(rds, pair, tf_swing, sig["type"], "top100"):
-                    results_top100.append(sig); record_new_silent(rds, sig, "top100")
-        except Exception as e: print(f"[scan-top100-swing] {pair} err:", e)
+    if reg_slow in ("ON","NEUTRAL"):
+        tf_swing = swingP.get("timeframe","4h")
+        for pair in top100_pairs:
+            try:
+                df4h = client.ohlcv(pair, tf_swing, 400)
+                zones = zones_cache.get(pair)
+                sig = swing_signal(df4h, swingP, sd_cfg, zones)
+                if sig:
+                    sig.update({"symbol":pair,"timeframe":tf_swing,"exchange":"mexc"})
+                    if not is_silent_open(rds, pair, tf_swing, sig["type"], "top100"):
+                        results_top100.append(sig); record_new_silent(rds, sig, "top100")
+            except Exception as e: print(f"[scan-top100-swing] {pair} err:", e)
 
     # TREND (1d)
-    for pair in top100_pairs:
-        try:
-            dfd = client.ohlcv(pair, "1d", 320)
-            zones = zones_cache.get(pair)
-            sig = trend_signal(dfd, trnP, sd_cfg, zones)
-            if sig:
-                sig.update({"symbol":pair,"timeframe":"1d","exchange":"mexc"})
-                if not is_silent_open(rds, pair, "1d", sig["type"], "top100"):
-                    results_top100.append(sig); record_new_silent(rds, sig, "top100")
-        except Exception as e: print(f"[scan-top100-trend] {pair} err:", e)
+    if reg_daily == "ON":
+        for pair in top100_pairs:
+            try:
+                dfd = client.ohlcv(pair, "1d", 320)
+                zones = zones_cache.get(pair)
+                sig = trend_signal(dfd, trnP, sd_cfg, zones)
+                if sig:
+                    sig.update({"symbol":pair,"timeframe":"1d","exchange":"mexc"})
+                    if not is_silent_open(rds, pair, "1d", sig["type"], "top100"):
+                        results_top100.append(sig); record_new_silent(rds, sig, "top100")
+            except Exception as e: print(f"[scan-top100-trend] {pair} err:", e)
 
     # ======== Movers Scan (legacy logic) ========
     for pair in movers_pairs:
@@ -596,52 +681,37 @@ def run(cfg: Dict[str,Any]):
                     results_movers.append(sig); record_new_silent(rds, sig, "movers")
         except Exception as e: print(f"[scan-movers] {pair} err:", e)
 
-    # ======== Bear-safe Scan (bearish -> inverse long) ========
-    if bear_cfg.get("enabled", True) and bear_mode.get("enabled", True):
-        # DAY bearish -> inverse on 1h
+    # ======== Bearish Scan (always) + bear-safe execution mapping ========
+    if bear_cfg.get("enabled", True):
+        # Day (1h)
         for pair in top100_pairs:
             try:
                 df1h = client.ohlcv(pair, bear_cfg.get("day", {}).get("timeframe","1h"), 300)
                 sigb = day_bearish_signal(df1h, bear_cfg)
                 if sigb:
-                    inv = map_bearish_to_inverse_token(client, pair, inv_suffix)
-                    if inv:
-                        sig = {"type":"inverse","entry":client.last_price(inv) or sigb["entry"],"stop":None,
-                               "t1":None,"t2":None,"level":sigb["level"],
-                               "note":f"Inverse LONG from bearish {pair}","event_bar_ts": sigb["event_bar_ts"],
-                               "symbol":inv,"timeframe":"1h","exchange":"mexc"}
-                        if not is_silent_open(rds, inv, "1h", "inverse", "bear"):
-                            results_bear.append(sig); record_new_silent(rds, sig, "bear")
+                    base_sig = dict(sigb); base_sig.update({"symbol":pair,"timeframe":"1h","exchange":"mexc"})
+                    if not is_silent_open(rds, pair, "1h", base_sig["type"], "bear"):
+                        results_bearish_report.append(base_sig); record_new_silent(rds, base_sig, "bear")
             except Exception as e: print(f"[bear-day] {pair} err:", e)
-        # SWING bearish -> inverse on 4h
+        # Swing (4h)
         for pair in top100_pairs:
             try:
                 df4h = client.ohlcv(pair, bear_cfg.get("swing", {}).get("timeframe","4h"), 400)
                 sigb = swing_bearish_signal(df4h, bear_cfg)
                 if sigb:
-                    inv = map_bearish_to_inverse_token(client, pair, inv_suffix)
-                    if inv:
-                        sig = {"type":"inverse","entry":client.last_price(inv) or sigb["entry"],"stop":None,
-                               "t1":None,"t2":None,"level":sigb["level"],
-                               "note":f"Inverse LONG from bearish {pair}","event_bar_ts": sigb["event_bar_ts"],
-                               "symbol":inv,"timeframe":"4h","exchange":"mexc"}
-                        if not is_silent_open(rds, inv, "4h", "inverse", "bear"):
-                            results_bear.append(sig); record_new_silent(rds, sig, "bear")
+                    base_sig = dict(sigb); base_sig.update({"symbol":pair,"timeframe":"4h","exchange":"mexc"})
+                    if not is_silent_open(rds, pair, "4h", base_sig["type"], "bear"):
+                        results_bearish_report.append(base_sig); record_new_silent(rds, base_sig, "bear")
             except Exception as e: print(f"[bear-swing] {pair} err:", e)
-        # TREND bearish -> inverse on 1d
+        # Trend (1d)
         for pair in top100_pairs:
             try:
                 dfd = client.ohlcv(pair, bear_cfg.get("trend", {}).get("timeframe","1d"), 320)
                 sigb = trend_bearish_signal(dfd, bear_cfg)
                 if sigb:
-                    inv = map_bearish_to_inverse_token(client, pair, inv_suffix)
-                    if inv:
-                        sig = {"type":"inverse","entry":client.last_price(inv) or sigb["entry"],"stop":None,
-                               "t1":None,"t2":None,"level":sigb["level"],
-                               "note":f"Inverse LONG from bearish {pair}","event_bar_ts": sigb["event_bar_ts"],
-                               "symbol":inv,"timeframe":"1d","exchange":"mexc"}
-                        if not is_silent_open(rds, inv, "1d", "inverse", "bear"):
-                            results_bear.append(sig); record_new_silent(rds, sig, "bear")
+                    base_sig = dict(sigb); base_sig.update({"symbol":pair,"timeframe":"1d","exchange":"mexc"})
+                    if not is_silent_open(rds, pair, "1d", base_sig["type"], "bear"):
+                        results_bearish_report.append(base_sig); record_new_silent(rds, base_sig, "bear")
             except Exception as e: print(f"[bear-trend] {pair} err:", e)
 
     # ======== Execution (paper or live) ========
@@ -649,8 +719,24 @@ def run(cfg: Dict[str,Any]):
     already_open_syms = set(v["symbol"] for v in active.values())
     n_open = len(already_open_syms)
 
-    all_sigs = results_top100 + results_movers + results_bear
-    for s in all_sigs:
+    # Combine *tradeable* signals:
+    all_trade_sigs: List[Dict[str,Any]] = []
+    all_trade_sigs += results_top100 + results_movers
+
+    # For bearish: convert to inverse (if available) for trading ONLY
+    if bear_mode.get("enabled", True):
+        for bs in results_bearish_report:
+            inv = map_bearish_to_inverse_token(client, bs["symbol"], inv_suffix)
+            if inv:
+                trade_sig = {"type":"inverse","entry":client.last_price(inv) or bs["entry"],"stop":max(1e-9,(client.last_price(inv) or bs['entry'])*0.85),
+                             "t1":None,"t2":None,"level":bs["level"],"note":f"Inverse LONG from bearish {bs['symbol']}",
+                             "event_bar_ts": bs["event_bar_ts"], "symbol":inv,"timeframe":bs["timeframe"],"exchange":"mexc"}
+                # no silent dup check here — we manage on base_sig earlier; for safety:
+                if not is_silent_open(rds, inv, trade_sig["timeframe"], trade_sig["type"], "bear"):
+                    all_trade_sigs.append(trade_sig); record_new_silent(rds, trade_sig, "bear")
+
+    trade_lines: List[str] = []
+    for s in all_trade_sigs:
         sym, tf, typ = s["symbol"], s["timeframe"], s["type"]
         entry = float(s["entry"]); stop = float(s["stop"]) if s.get("stop") is not None else max(1e-9, entry*0.85)
         if sym in already_open_syms or n_open >= max_pos: continue
@@ -689,9 +775,9 @@ def run(cfg: Dict[str,Any]):
     silent_dashboard(rds)
 
     # ======== Discord ========
-    top100_msg = fmt_signal_lines("Signals — Top 100", results_top100)
+    top100_msg = fmt_signal_lines("Signals — Top 100 (Bullish)", results_top100)
     movers_msg = fmt_signal_lines("Signals — Movers", results_movers)
-    bear_msg   = fmt_signal_lines("Signals — Bear-Safe (Inverse)", results_bear)
+    bear_msg   = fmt_signal_lines("Signals — Bearish (Base Pairs)", results_bearish_report)
     if top100_msg: _post_discord(SIG_HOOK, top100_msg)
     if movers_msg: _post_discord(SIG_HOOK, movers_msg)
     if bear_msg:   _post_discord(SIG_HOOK, bear_msg)
@@ -712,44 +798,7 @@ def run(cfg: Dict[str,Any]):
         print(f"Equity:    {equity:.2f} USDT  | Unrealized PnL: {pnl_total:+.2f} USDT")
         print("--- End Snapshot ---")
 
-
-# --- DIAGNOSTICS ---
-def log_universe_stats(label, raw_syms, mexc_pairs):
-    print(f"[universe] {label}: CMC syms={len(raw_syms)} -> MEXC tradable (ex-stables)={len(mexc_pairs)}")
-
-# --- MEXC FALLBACK UNIVERSE (Top USDT-volume spot pairs) ---
-def mexc_top_usdt_volume_pairs(client: ExClient, *, max_pairs=60, min_usd_vol=2_000_000, extra_stables=None):
-    extra_stables = extra_stables or []
-    try:
-        tickers = client.ex.fetch_tickers()
-    except Exception as e:
-        print("[fallback] fetch_tickers err:", e)
-        return []
-    items = []
-    for sym, t in tickers.items():
-        if "/USDT" not in sym:
-            continue
-        if is_stable_or_pegged(sym, extra_stables):
-            continue
-        qv = t.get("quoteVolume")
-        if qv is None:
-            base_v = t.get("baseVolume")
-            last = t.get("last") or t.get("close")
-            try:
-                qv = (base_v or 0) * (last or 0)
-            except Exception:
-                qv = 0
-        try:
-            qv = float(qv or 0)
-        except Exception:
-            qv = 0.0
-        if qv >= float(min_usd_vol):
-            items.append((sym, qv))
-    items.sort(key=lambda x: x[1], reverse=True)
-    pairs = [s for s,_ in items[:max_pairs]]
-    print(f"[fallback] MEXC top USDT-volume picked {len(pairs)} pairs (min_usd_vol={min_usd_vol})")
-    return pairs
-# =============== Entrypoint ===============
+# ================== Entrypoint ==================
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="mexc_trader_bot_config.yml")
