@@ -4,6 +4,14 @@ persistence:
   key_prefix: spideybot:v1
   ttl_minutes: 2880
 
+  eth_regime:
+  enabled: true              # gate bullish signals by ETH/USDT state (Top100 only)
+  require_ema_stack: true    # ETH EMA20 > EMA50
+  require_macd_bull: true    # ETH MACD line > signal
+  rsi_min: 52                # ETH RSI lower bound
+  breakout_lookback: 30      # window for regime swing-high
+  require_above_reghigh: false  # set true if you want ETH last close > prior swing high
+
 # ========= Trading =========
 trading:
   paper: true
