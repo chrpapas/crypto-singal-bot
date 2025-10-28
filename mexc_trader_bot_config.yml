@@ -77,12 +77,22 @@ movers:
   quote: USDT
   cmc_api_key: "${CMC_API_KEY}"
 
-# ========= Bearish detectors + inverse mapping =========
+market_gate:
+  enabled: true
+  eth_symbol: "ETH/USDT"
+  fast_tf: "1h"
+  slow_tf: "4h"
+  trend_tf: "1d"
+  rsi_min_on: 50
+  near_res_pct: 2.0
+  swing_high_lookback: 34
+  require_neutral_extra_confirmations: 1
+
 bearish_signals:
   enabled: true
   day:
     timeframe: "1h"
-    lookback_low: 30
+    lookback_low: 20
     vol_sma: 20
     require_breakdown: true
     require_vol_confirm: true
@@ -101,7 +111,7 @@ bearish_signals:
 
 bear_mode:
   enabled: true
-  inverse_suffixes: ["3S","5S"]   # try BASE3S/USDT, then BASE5S/USDT
+  inverse_suffixes: ["3S","5S"]   # execution only; signals post for base pair regardless  # try BASE3S/USDT, then BASE5S/USDT
 
 # ========= Futures (stub for later live perps) =========
 futures:
