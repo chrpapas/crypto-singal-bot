@@ -255,15 +255,18 @@ def backtest(cfg: Dict[str,Any], universe: str, tf: str, start: str, end: str,
     # Build rolling ETH gate series once
     eth_cfg = cfg.get("eth_gate", {"enabled": True, "require_ema_stack": True, "min_rsi": 50})
     eth_gate_df = pd.DataFrame()
-    if gate_on and eth_cfg.get("enabled", True):
+    
+    eth_enabled = bool(eth_cfg.get("enabled", True))
+    
+    if eth_enabled and gate_on:
         eth_gate_df = build_eth_gate_series(client, tf, start_utc, end_utc, eth_cfg)
         if eth_gate_df.empty:
             print("[eth-gate] series empty; gate will effectively block longs.")
         else:
             last = eth_gate_df.iloc[-1]
-            print(f"[eth-gate] sample -> gate_ok(last)={bool(last['gate_ok'])} | EMA20={last['ema20']:.2f} EMA50={last['ema50']:.2f} RSI={last['rsi']:.1f}")
+            print(f"[eth-gate] sample -> gate_ok(last)={bool(last.get('gate_ok', False))} | EMA20={last['ema20']:.2f} EMA50={last['ema50']:.2f} RSI={last['rsi']:.1f}")
     else:
-        print("[eth-gate] OFF")
+        print("[eth-gate] OFF (config disabled or CLI off)")
 
     # Backtest
     trades: List[Dict[str,Any]] = []
