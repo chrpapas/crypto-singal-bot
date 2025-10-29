@@ -1,21 +1,13 @@
 # ========= Persistence =========
 persistence:
-  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
+  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"   # or use REDIS_URL env
   key_prefix: spideybot:v1
   ttl_minutes: 2880
 
-  eth_regime:
-  enabled: true              # gate bullish signals by ETH/USDT state (Top100 only)
-  require_ema_stack: true    # ETH EMA20 > EMA50
-  require_macd_bull: true    # ETH MACD line > signal
-  rsi_min: 52                # ETH RSI lower bound
-  breakout_lookback: 30      # window for regime swing-high
-  require_above_reghigh: false  # set true if you want ETH last close > prior swing high
-
 # ========= Trading =========
 trading:
-  paper: true
-  base_balance_usdt: 1000
+  paper: true                 # true=paper, false=live
+  base_balance_usdt: 1000     # for paper init
   risk_per_trade_pct: 1.0
   max_concurrent_positions: 10
   min_usdt_order: 10
@@ -23,11 +15,11 @@ trading:
 
 # ========= Filters =========
 filters:
-  extra_stables: ["USDY","USDE","FDUSD","PAXG","XAUT"]  # extend as needed
+  extra_stables: ["USDY","USDE"]  # optional extra base symbols to treat as stables
 
 # ========= Supply/Demand (optional) =========
 supply_demand:
-  enabled: true
+  enabled: false
   timeframe_for_zones: "1h"
   lookback: 300
   impulse_factor: 1.8
@@ -83,19 +75,18 @@ movers:
   min_volume_usd_24h: 5000000
   max_age_days: 365
   quote: USDT
-  cmc_api_key: "${CMC_API_KEY}"
+  cmc_api_key: "${CMC_API_KEY}"     # or set ENV CMC_API_KEY
 
-market_gate:
+# ========= ETH gate (Top-100 bullish entries only) =========
+eth_gate:
   enabled: true
-  eth_symbol: "ETH/USDT"
-  fast_tf: "1h"
-  slow_tf: "4h"
-  trend_tf: "1d"
-  rsi_min_on: 50
-  near_res_pct: 2.0
-  swing_high_lookback: 34
-  require_neutral_extra_confirmations: 1
+  timeframe: "1h"
+  require_ema_stack: true    # EMA20 > EMA50
+  min_rsi: 50
+  require_breakout: false
+  lookback_breakout: 30
 
+# ========= Bearish detectors + inverse trading =========
 bearish_signals:
   enabled: true
   day:
@@ -119,20 +110,20 @@ bearish_signals:
 
 bear_mode:
   enabled: true
-  inverse_suffixes: ["3S","5S"]   # execution only; signals post for base pair regardless  # try BASE3S/USDT, then BASE5S/USDT
+  inverse_suffixes: ["3S","5S"]   # try BASE3S/USDT, then BASE5S/USDT for trading
 
-# ========= Futures (stub for later live perps) =========
-futures:
-  enabled: false
-
-# ========= Fallback universe (diagnostics + liquidity-based backup) =========
+# ========= Fallback universe (if CMC→MEXC too small) =========
 fallback:
   enabled: true
-  min_pairs: 30
-  min_usd_vol: 2000000
+  min_pairs: 30                 # if fewer than this from mapping, use top-volume fallback
   max_pairs: 60
+  min_usd_vol: 2000000
 
 # ========= Discord (webhooks also read from ENV) =========
 discord:
-  signals_webhook: ""   # prefer env DISCORD_SIGNALS_WEBHOOK
-  trades_webhook: ""    # prefer env DISCORD_TRADES_WEBHOOK
+  signals_webhook: ""           # fallback if env missing
+  trades_webhook: ""            # fallback if env missing
+
+# ========= Futures (stubbed for later) =========
+futures:
+  enabled: false
