@@ -79,7 +79,7 @@ movers:
 
 # ========= ETH gate (Top-100 bullish entries only) =========
 eth_gate:
-  enabled: true
+  enabled: false
   timeframe: "1h"
   require_ema_stack: true    # EMA20 > EMA50
   min_rsi: 50
