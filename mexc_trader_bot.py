@@ -335,7 +335,6 @@ def map_bearish_to_inverse_token(client: ExClient, pair: str, suffixes: List[str
 def silent_key(symbol: str, tf: str, typ: str, source: str) -> str:
     return f"{symbol}|{tf}|{typ}|{source}"
 
-# Canonical key for bear alerts — ALWAYS underlying pair + fixed type 'bear'
 def bear_alert_key(underlying_pair: str, timeframe: str) -> str:
     return f"{underlying_pair}|{timeframe}|bear|bear"
 
@@ -353,10 +352,9 @@ def record_new_silent(rds: RedisState, sig: Dict[str,Any], source: str):
     }
     rds.save_json(book, "state","silent_open")
 
-# Bear invalidation check
 def bear_still_valid(df: pd.DataFrame, cfg: Dict[str,Any]) -> bool:
-    if df is None or len(df) < 60: 
-        return True  # if we cannot evaluate, don't auto-close
+    if df is None or len(df) < 60:
+        return True
     e20, e50 = ema(df["close"],20), ema(df["close"],50)
     r = rsi(df["close"],14)
     if e20.iloc[-1] >= e50.iloc[-1]:
@@ -372,8 +370,7 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
     for k, tr in list(book.items()):
         if tr.get("status")!="open": continue
         pair = tr["symbol"]; tf = tr["tf"]; stop = tr.get("stop"); t1 = tr.get("t1")
-        # Bear alert path — revalidate bearish condition on underlying
-        if tr.get("type") == "bear":
+        if tr.get("type", "").startswith("bear"):
             underlying = tr.get("underlying") or pair
             try:
                 limit = 260 if tf == "1h" else (400 if tf == "4h" else 320)
@@ -385,8 +382,6 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
             except Exception as e:
                 print("[silent-bear] eval err", underlying, tf, e)
             continue
-
-        # Long signals: close on stop/t1 (target-first priority)
         try:
             limit = 400 if tf in ("1h","4h") else 330
             df = client.ohlcv(pair, tf, limit)
@@ -396,9 +391,8 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
             outcome=None; price=None
             for _,r in rows.iterrows():
                 lo, hi = float(r["low"]), float(r["high"])
-                if (lo <= (stop if stop is not None else -1e18)) and (t1 is not None and hi >= t1):
-                    outcome, price = ("t1", t1)  # target-first priority
-                    break
+                if (stop is not None and lo <= stop) and (t1 is not None and hi >= t1):
+                    outcome, price = "t1", t1; break
                 if stop is not None and lo <= stop:
                     outcome, price = "stop", stop; break
                 if t1 is not None and hi >= t1:
@@ -413,20 +407,39 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
 
 def silent_dashboard(rds: RedisState):
     book = rds.load_json("state","silent_open", default={})
-    by = {"day": {"open":0,"closed":0,"wins":0}, "swing":{"open":0,"closed":0,"wins":0},
-          "trend":{"open":0,"closed":0,"wins":0}, "mover":{"open":0,"closed":0,"wins":0}, "bear":{"open":0,"closed":0,"wins":0}}
+    by = {
+        "day": {"open":0,"closed":0,"wins":0},
+        "swing":{"open":0,"closed":0,"wins":0},
+        "trend":{"open":0,"closed":0,"wins":0},
+        "mover":{"open":0,"closed":0,"wins":0},
+        "bear":{"open":0,"closed":0,"wins":0},
+        "other":{"open":0,"closed":0,"wins":0},
+    }
     for tr in book.values():
         src = tr.get("source","top100")
-        bucket = "mover" if src=="movers" else ("bear" if tr.get("type")=="bear" else tr.get("type","day"))
-        if tr.get("status")=="open": by[bucket]["open"] += 1
+        typ = (tr.get("type") or "").lower()
+        if src == "movers":
+            bucket = "mover"
+        elif typ.startswith("bear"):
+            bucket = "bear"
+        elif typ in ("day","swing","trend"):
+            bucket = typ
         else:
+            bucket = "other"
+        if tr.get("status")=="open":
+            by.setdefault(bucket, {"open":0,"closed":0,"wins":0})
+            by[bucket]["open"] += 1
+        else:
+            by.setdefault(bucket, {"open":0,"closed":0,"wins":0})
             by[bucket]["closed"] += 1
-            if tr.get("outcome") in ("t1","bear_exit_win"): by[bucket]["wins"] += 1
+            if tr.get("outcome") in ("t1","bear_exit_win"):
+                by[bucket]["wins"] += 1
     print("--- Silent Signal Performance (since reset) ---")
     def line(name,k):
-        o=by[k]["open"]; c=by[k]["closed"]; w=by[k]["wins"]; winp=(w/max(1,c))*100.0 if c>0 else 0.0
+        d = by.get(k, {"open":0,"closed":0,"wins":0})
+        o=d["open"]; c=d["closed"]; w=d["wins"]; winp=(w/max(1,c))*100.0 if c>0 else 0.0
         print(f"{name:6}: closed {c} | open {o} | win% {winp:.1f}%")
-    line("Day","day"); line("Swing","swing"); line("Trend","trend"); line("Mover","mover"); line("Bear","bear")
+    line("Day","day"); line("Swing","swing"); line("Trend","trend"); line("Mover","mover"); line("Bear","bear"); line("Other","other")
     print("--- End Silent Performance ---")
 
 # =============== Paper portfolio + trades ===============
@@ -475,9 +488,10 @@ def fmt_signal_lines(title: str, sigs: List[Dict[str,Any]]) -> str:
     if not sigs: return ""
     lines=[f"**{title}**"]
     for s in sigs:
+        stop_txt = f"{s['stop']:.6f}" if s.get('stop') is not None else "None"
         lines.append(
             f"• `{s['symbol']}` {s['timeframe']} *{s['type']}* — {s['note']}\n"
-            f"  entry `{s['entry']:.6f}` stop `{s['stop'] if s.get('stop') is not None else 'None'}` t1 `{s.get('t1')}` t2 `{s.get('t2')}`"
+            f"  entry `{s['entry']:.6f}` stop `{stop_txt}` t1 `{s.get('t1')}` t2 `{s.get('t2')}`"
         )
     return "\n".join(lines)
 
@@ -487,7 +501,6 @@ def fmt_trade_lines(trades: List[str]) -> str:
 
 # =============== ETH gate ===============
 def eth_gate_ok(client: ExClient, tf: str, cfg: Dict[str,Any]) -> Optional[bool]:
-    # returns True/False or None if cannot fetch
     try:
         df = client.ohlcv("ETH/USDT", tf, 200)
         e20, e50 = ema(df["close"],20), ema(df["close"],50)
@@ -565,11 +578,6 @@ def run(cfg: Dict[str,Any]):
     # ETH gate config (applies only to Top-100 *bullish* signals)
     eth_cfg = cfg.get("eth_gate", {"enabled": True, "require_ema_stack": True, "min_rsi": 50})
 
-    # Futures toggle (placeholder)
-    fut_cfg = cfg.get("futures", {"enabled": False})
-    if fut_cfg.get("enabled"):
-        print("[futures] Perp futures enabled in config — execution currently stubbed; spot inverse tokens are used for bear-safe flow.")
-
     # State
     positions = rds.load_json("state","active_positions", default={})
     pf        = ensure_portfolio(rds, trading_cfg) if paper_mode else {}
@@ -611,19 +619,17 @@ def run(cfg: Dict[str,Any]):
                 print(f"[zones] {pair} err:", e); zones_cache[pair]=[]
 
     # ETH gate status (for Top100 bullish only)
-    gate_msg = "OFF"
     if eth_cfg.get("enabled", True):
         g = eth_gate_ok(client, swingP.get("timeframe","4h"), eth_cfg)
         if g is None:
-            gate_msg = "OFF (ETH fetch error -> not gating)"
             eth_gate_on = False
+            print(f"[eth-gate] 4h:OFF (ETH fetch error -> not gating)")
         else:
             eth_gate_on = bool(g)
-            gate_msg = f"{'ON' if eth_gate_on else 'OFF'}"
+            print(f"[eth-gate] 4h:{'ON' if eth_gate_on else 'OFF'}")
     else:
         eth_gate_on = False
-        gate_msg = "OFF (config disabled)"
-    print(f"[eth-gate] 4h:{gate_msg}")
+        print(f"[eth-gate] 4h:OFF (config disabled)")
 
     results_top100: List[Dict[str,Any]] = []
     results_movers: List[Dict[str,Any]] = []
@@ -658,8 +664,6 @@ def run(cfg: Dict[str,Any]):
                 sig=None
             if sig:
                 sig.update({"symbol":pair,"timeframe":"1h","exchange":"mexc"})
-                if not is_silent_open(rds=RedisState, symbol="", tf="", typ="", source=""):  # placeholder to keep lint calm
-                    ...
                 if not is_silent_open_top100(rds, pair, "1h", sig["type"]):
                     results_top100.append(sig); record_new_silent(rds, sig, "top100")
         except Exception as e: print(f"[scan-top100-day] {pair} err:", e)
@@ -706,7 +710,6 @@ def run(cfg: Dict[str,Any]):
 
     # ======== Bear-safe Scan (bearish -> inverse long if available; always alert) ========
     if bear_cfg.get("enabled", True) and bear_mode.get("enabled", True):
-        # helper to process a bearish signal into results + silent registry
         def process_bear_sig(pair:str, timeframe:str, sigb:Dict[str,Any]):
             if not sigb: return
             underlying = pair
@@ -726,12 +729,11 @@ def run(cfg: Dict[str,Any]):
                 "timeframe": timeframe,
                 "exchange":"mexc"
             }
-            # silent — canonical key on underlying
             book = rds.load_json("state","silent_open", default={})
             k = bear_alert_key(underlying, timeframe)
             exists = book.get(k)
             if exists and exists.get("bar_id") == sig["event_bar_ts"]:
-                return  # already alerted for this bar
+                return
             if not exists:
                 results_bear.append(sig)
                 book[k] = {
@@ -748,22 +750,18 @@ def run(cfg: Dict[str,Any]):
                     "bar_id": sig["event_bar_ts"]
                 }
                 rds.save_json(book, "state","silent_open")
-            # Bear exits: close open long positions on same underlying (Top100 & Movers)
             apply_bear_exits(underlying, display_symbol, timeframe, client, rds, pf, paper_mode, trade_lines)
 
-        # DAY bearish -> inverse on 1h
         for pair in top100_pairs:
             try:
                 df1h = client.ohlcv(pair, bear_cfg.get("day", {}).get("timeframe","1h"), 300)
                 process_bear_sig(pair, "1h", day_bearish_signal(df1h, bear_cfg))
             except Exception as e: print(f"[bear-day] {pair} err:", e)
-        # SWING bearish -> inverse on 4h
         for pair in top100_pairs:
             try:
                 df4h = client.ohlcv(pair, bear_cfg.get("swing", {}).get("timeframe","4h"), 400)
                 process_bear_sig(pair, "4h", swing_bearish_signal(df4h, bear_cfg))
             except Exception as e: print(f"[bear-swing] {pair} err:", e)
-        # TREND bearish -> inverse on 1d
         for pair in top100_pairs:
             try:
                 dfd = client.ohlcv(pair, bear_cfg.get("trend", {}).get("timeframe","1d"), 320)
@@ -774,9 +772,8 @@ def run(cfg: Dict[str,Any]):
     active = positions.setdefault("active_positions", {})
     already_open_syms = set(v["symbol"] for v in active.values())
     n_open = len(already_open_syms)
-    all_sigs = results_top100 + results_movers + []  # bear doesn't auto-long unless inverse and you want to; keep signals separate
+    all_sigs = results_top100 + results_movers  # bear signals do not auto-long here
 
-    # Execute longs from bullish signals only (Top100/Movers)
     for s in all_sigs:
         sym, tf, typ = s["symbol"], s["timeframe"], s["type"]
         entry = float(s["entry"]); stop = float(s["stop"]) if s.get("stop") is not None else max(1e-9, entry*0.85)
@@ -851,7 +848,6 @@ def is_silent_open_movers(rds: RedisState, symbol:str, tf:str, typ:str) -> bool:
 # Bear exits — close open long positions and liquidate paper holding for the underlying
 def apply_bear_exits(underlying_pair: str, display_symbol: str, tf: str, client: ExClient, rds: RedisState,
                      pf: Dict[str,Any], paper_mode: bool, trade_lines: List[str]):
-    # Close any open long signals on this underlying (Top100/Movers)
     positions = rds.load_json("state","active_positions", default={})
     active = positions.setdefault("active_positions", {})
     to_close = []
@@ -860,16 +856,13 @@ def apply_bear_exits(underlying_pair: str, display_symbol: str, tf: str, client:
             to_close.append(k)
     if not to_close:
         return
-    price = client.last_price(underlying_pair) or client.last_price(display_symbol)
-    if price is None:
-        price = 0.0
+    price = client.last_price(underlying_pair) or client.last_price(display_symbol) or 0.0
     for k in to_close:
         sym = active[k]["symbol"]
         if paper_mode:
             proceeds = paper_sell_all(rds, pf, sym, price)
             trade_lines.append(f"• BEAR EXIT `{sym}` {tf} @ `{price:.6f}` (paper) proceeds `{proceeds:.2f}`")
         else:
-            # live: try to sell entire balance of 'sym' if available (not always possible via this skeleton)
             trade_lines.append(f"• BEAR EXIT `{sym}` {tf} @ `~{price:.6f}` (live)")
         active.pop(k, None)
     rds.save_json(positions, "state","active_positions")
