@@ -48,8 +48,8 @@ swing_trade_params:
   ema20: 20
   ema50: 50
   ema100: 100
-  pullback_pct_max: 10.0
-  rsi_min: 50
+  pullback_pct_max: 8.0     # tightened from 10.0
+  rsi_min: 55               # tightened from 50
   vol_sma: 20
   breakout_lookback: 34
   stop_mode: "swing"
@@ -59,30 +59,27 @@ trend_trade_params:
   ema20: 20
   ema50: 50
   ema100: 100
-  pullback_pct_max: 10.0
-  rsi_min: 50
+  pullback_pct_max: 8.0     # tightened from 10.0
+  rsi_min: 55               # tightened from 50
   rsi_max: 70
   vol_sma: 20
   breakout_lookback: 55
   stop_mode: "swing"
   atr_mult: 2.0
 
-# ========= Movers (legacy) =========
+# ========= Movers (legacy / universe builder) =========
 movers:
-  enabled: true
-  limit: 500
-  min_change_24h: 15.0
-  min_volume_usd_24h: 5000000
-  max_age_days: 365
-  quote: USDT
-  cmc_api_key: "${CMC_API_KEY}"     # or set ENV CMC_API_KEY
+  min_change_24h: 25.0            # stronger movers only
+  min_volume_usd_24h: 10000000.0  # more liquid
+  limit: 40                       # fewer, higher quality names
+  cmc_api_key: ${CMC_API_KEY}     # or set ENV CMC_API_KEY
 
-# ========= ETH gate (Top-100 bullish entries only) =========
+# ========= ETH gate (Top-100 / movers bullish entries only) =========
 eth_gate:
-  enabled: true
-  timeframe: "1h"
-  require_ema_stack: true    # EMA20 > EMA50
-  min_rsi: 50
+  enabled: true          # was false
+  timeframe: "4h"        # use 4h ETH regime for 4h signals
+  require_ema_stack: true    # ETH ema20 > ema50
+  min_rsi: 52            # ETH RSI must be at least 52
   require_breakout: false
   lookback_breakout: 30
 
@@ -95,17 +92,6 @@ bearish_signals:
     vol_sma: 20
     require_breakdown: true
     require_vol_confirm: true
-    rsi_max: 50
-  swing:
-    timeframe: "4h"
-    lookback_low: 34
-    ema_stack_bear: true
-    require_vol_confirm: true
-    rsi_max: 50
-  trend:
-    timeframe: "1d"
-    lookback_low: 55
-    ema20_below_50: true
     rsi_max: 50
 
 bear_mode:
@@ -127,3 +113,11 @@ discord:
 # ========= Futures (stubbed for later) =========
 futures:
   enabled: false
+
+# ========= Exits for backtester / bot =========
+exit_params:
+  tp1_R: 1.5          # 50% off at +1.5R
+  tp2_R: 4.0          # optional TP2 at +4R for the remainder
+  atr_len: 20         # ATR window
+  atr_k: 3.5          # ATR trail: highest_close_since_TP1 - 3.5 * ATR
+  time_stop_bars: 30  # time stop after 30 bars on main TF
