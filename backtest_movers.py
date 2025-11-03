@@ -1,305 +1,366 @@
-# backtest_movers.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, os, math, json, time
-from typing import Dict, List, Tuple, Optional
-import pandas as pd
-import numpy as np
+"""
+backtest_movers.py — backtest the *legacy_mover_signal* logic on MEXC spot
+
+- Builds a high-liquidity /USDT universe from MEXC tickers (volume-based)
+- Uses the same legacy_mover_signal (E20/E50 + MACD + RSI + breakout) as the live bot
+- Entry = close of signal bar
+- Exit = first hit of either stop or t1, with t1 taking priority when both hit in the same bar
+- Outputs:
+    ./backtest_out/movers_trades.csv
+    ./backtest_out/movers_equity_curve.csv
+
+Example:
+  python3 backtest_movers.py --config mexc_trader_bot_config.yml --start 2025-09-01 --end 2025-10-29 --tf 1h
+"""
+
+import argparse, os
+from typing import Dict, Any, List, Optional
+
 import ccxt
+import numpy as np
+import pandas as pd
+import yaml
 
-# ================= TA helpers =================
-def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
-def sma(s: pd.Series, n: int) -> pd.Series: return s.rolling(n).mean()
+# ===== TA helpers (must match live bot) =====
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+def sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n).mean()
+
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    d = series.diff(); up = d.clip(lower=0).rolling(length).mean(); dn = -d.clip(upper=0).rolling(length).mean()
-    rs = up / (dn + 1e-9); return 100 - (100 / (1 + rs))
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    f = ema(series, fast); s = ema(series, slow); line = f - s; sig = line.ewm(span=signal, adjust=False).mean()
-    hist = line - sig; return line, sig, hist
+    d = series.diff()
+    up = d.clip(lower=0).rolling(length).mean()
+    dn = -d.clip(upper=0).rolling(length).mean()
+    rs = up / (dn + 1e-9)
+    return 100 - (100 / (1 + rs))
 
-# ================ Stable filters =================
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    f = ema(series, fast)
+    s = ema(series, slow)
+    line = f - s
+    sig = line.ewm(span=signal, adjust=False).mean()
+    hist = line - sig
+    return line, sig, hist
+
+# ===== Stable filtering (same as bot) =====
 DEFAULT_STABLES = {
     "USDT","USDC","USDD","DAI","FDUSD","TUSD","BUSD","PAX","PAXG","XAUT","USD1","USDE","USDY",
     "USDP","SUSD","EURS","EURT","PYUSD"
 }
-def is_stable_base(sym_pair: str, extra: List[str]) -> bool:
-    base, _ = sym_pair.split("/")
-    b = base.upper().replace("3L","").replace("5L","").replace("3S","").replace("5S","")
+
+def is_stable_or_pegged(symbol: str, extra: List[str]) -> bool:
+    base, _ = symbol.split("/")
+    b = base.upper().replace("3L", "").replace("3S", "").replace("5L", "").replace("5S", "")
     extras = {e.upper() for e in (extra or [])}
     return (b in DEFAULT_STABLES) or (b in extras)
 
-# ================ Mover signal =================
-def mover_signal_1h(df: pd.DataFrame) -> Optional[Dict]:
+# ===== Legacy movers signal (copied from bot) =====
+def legacy_mover_signal(df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
-    Legacy mover breakout:
-    - EMA20 > EMA50
+    Exact same logic as in mexc_trader_bot.py
+
+    Conditions:
+    - E20 > E50
     - MACD line > signal
-    - RSI in [55,80]
-    - Close > highest high of last 30 bars (excluding current)
-    - Volume >= 20SMA
-    Stop = min(last 10 lows)
-    TP = +5%
+    - 55 <= RSI(14) <= 80
+    - Close > 31-bar high (excluding current bar)
+    - Volume >= SMA20(volume)
     """
-    if df is None or len(df) < 80: return None
-    e20, e50 = ema(df["close"],20), ema(df["close"],50)
-    mac_line, mac_sig, _ = macd(df["close"])
-    r = rsi(df["close"],14); vS = sma(df["volume"], 20)
-    last = df.iloc[-1]
-    hl = df["high"].iloc[-31:-1].max()
-    aligned = (e20.iloc[-1] > e50.iloc[-1]) and (mac_line.iloc[-1] > mac_sig.iloc[-1]) and (55 <= r.iloc[-1] <= 80)
-    vol_ok = last["volume"] >= (vS.iloc[-1] if not np.isnan(vS.iloc[-1]) else last["volume"])
-    breakout = last["close"] > hl
-    if not (aligned and vol_ok and breakout): return None
-    entry = float(last["close"]); stop = float(min(df["low"].iloc[-10:]))
+    if df1h is None or len(df1h) < 80:
+        return None
+
+    e20, e50 = ema(df1h["close"], 20), ema(df1h["close"], 50)
+    mac_line, mac_sig, _ = macd(df1h["close"])
+    r = rsi(df1h["close"], 14)
+    vS = sma(df1h["volume"], 20)
+
+    last = df1h.iloc[-1]
+    hl = df1h["high"].iloc[-31:-1].max()
+
+    aligned = (
+        (e20.iloc[-1] > e50.iloc[-1])
+        and (mac_line.iloc[-1] > mac_sig.iloc[-1])
+        and (55 <= r.iloc[-1] <= 80)
+    )
+
+    breakout = (
+        last["close"] > hl
+        and last["volume"] >= (vS.iloc[-1] if not np.isnan(vS.iloc[-1]) else last["volume"])
+    )
+
+    if not (aligned and breakout):
+        return None
+
+    entry = float(last["close"])
+    stop = float(min(df1h["low"].iloc[-10:]))
+    t1 = round(entry * 1.05, 6)
+    t2 = round(entry * 1.10, 6)
+
     return {
-        "type": "mover",
+        "type": "day",
         "entry": entry,
         "stop": stop,
-        "t1": round(entry*1.05, 12),
+        "t1": t1,
+        "t2": t2,
         "level": float(hl),
         "note": "Mover Trend",
-        "event_bar_ts": df.index[-1].isoformat()
+        "event_bar_ts": df1h.index[-1].isoformat(),
     }
 
-# ================ CCXT helpers =================
-def load_mexc_symbols(ex) -> List[str]:
-    mkts = ex.load_markets()
-    syms = []
-    for k,m in mkts.items():
-        if "/USDT" in k and m.get("spot", True):
-            syms.append(k)
-    return sorted(list(set(syms)))
+# ===== Universe & data =====
+def build_universe(
+    ex: ccxt.Exchange,
+    extra_stables: List[str],
+    min_usd_vol: float = 2_000_000,
+    max_pairs: int = 120,
+) -> List[str]:
+    print("[universe] candidates -> scanning /USDT spot tickers…")
+    try:
+        tickers = ex.fetch_tickers()
+    except Exception as e:
+        print("[error] fetch_tickers:", e)
+        return []
 
-def fetch_ohlcv_range(ex, symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """
-    Pull all candles between start_ms and end_ms (inclusive) using CCXT pagination.
-    """
-    limit = 1000
-    out = []
-    since = start_ms
-    while True:
-        rows = ex.fetch_ohlcv(symbol, timeframe=tf, since=since, limit=limit)
-        if not rows:
-            break
-        out.extend(rows)
-        last_ts = rows[-1][0]
-        # stop if we've reached the end
-        if last_ts >= end_ms - 1:
-            break
-        # prevent infinite loop
-        next_since = last_ts + 1
-        if next_since <= since:
-            break
-        since = next_since
-        # Rate limit guard
-        time.sleep(ex.rateLimit/1000.0 if getattr(ex, "rateLimit", 0) else 0.2)
-    if not out:
-        return pd.DataFrame(columns=["open","high","low","close","volume"], index=pd.to_datetime([], utc=True))
-    df = pd.DataFrame(out, columns=["ts","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    df = df.set_index("ts")
-    # CCXT sometimes returns duplicates; drop and sort
-    df = df[~df.index.duplicated(keep="last")].sort_index()
-    return df
+    items = []
+    for sym, t in tickers.items():
+        if "/USDT" not in sym:
+            continue
+        if is_stable_or_pegged(sym, extra_stables):
+            continue
+        # skip non-spot if ccxt marks them
+        if t.get("spot") is False:
+            continue
 
-# ================ Rolling movers universe (per bar) =================
-def rolling_quote_volume(df: pd.DataFrame, lookback: int) -> pd.Series:
-    # approximate $ volume = close * volume; sum across last N bars
-    return (df["close"] * df["volume"]).rolling(lookback).sum()
+        qv = t.get("quoteVolume")
+        if qv is None:
+            base_v = t.get("baseVolume")
+            last = t.get("last") or t.get("close")
+            try:
+                qv = (base_v or 0) * (last or 0)
+            except Exception:
+                qv = 0
 
-# ================ Backtest core =================
-def backtest_movers(
+        try:
+            qv = float(qv or 0)
+        except Exception:
+            qv = 0.0
+
+        if qv >= min_usd_vol:
+            items.append((sym, qv))
+
+    items.sort(key=lambda x: x[1], reverse=True)
+    pairs = [s for s, _ in items[:max_pairs]]
+    print(f"[universe] volume universe -> {len(pairs)} /USDT spot pairs (ex-stables), min_vol=${min_usd_vol:,.0f}")
+    return pairs
+
+def fetch_all_ohlcv(
+    ex: ccxt.Exchange,
+    pairs: List[str],
+    tf: str,
     start: str,
     end: str,
-    tf: str = "1h",
-    min_usd_vol_lookback: int = 24,        # 24 bars ~ 1d on 1h TF
-    min_usd_vol: float = 2_000_000.0,
-    max_pairs: int = 120,
-    extra_stables: List[str] = None,
-    out_dir: str = "./backtest_out"
-):
-    extra_stables = extra_stables or []
+    warmup_bars: int = 200,
+) -> Dict[str, pd.DataFrame]:
+    start_ts = pd.to_datetime(start).tz_localize("UTC")
+    end_ts = pd.to_datetime(end).tz_localize("UTC")
 
-    start_utc = pd.Timestamp(start, tz="UTC")
-    end_utc   = pd.Timestamp(end, tz="UTC")
+    tf_minutes = {
+        "1m": 1,
+        "5m": 5,
+        "15m": 15,
+        "30m": 30,
+        "1h": 60,
+        "4h": 240,
+        "1d": 1440,
+    }.get(tf, 60)
 
-    ex = ccxt.mexc({"enableRateLimit": True})
-    symbols = load_mexc_symbols(ex)
-    symbols = [s for s in symbols if not is_stable_base(s, extra_stables)]
-    # slice to potential max_pairs (we’ll still filter by rolling volume later)
-    symbols = symbols[:max_pairs]
+    total_minutes = (end_ts - start_ts).total_seconds() / 60.0
+    need_bars = int(total_minutes / tf_minutes) + warmup_bars + 10
+    limit = max(need_bars, warmup_bars + 50)
 
-    print(f"[universe] candidates -> {len(symbols)} /USDT spot pairs (ex-stables), pulling candles…")
-
-    # Pull data for all symbols
     all_dfs: Dict[str, pd.DataFrame] = {}
-    for i, sym in enumerate(symbols, 1):
+    n = len(pairs)
+    print(f"[data] fetching OHLCV for {n} pairs, tf={tf}, limit~{limit} bars each…")
+
+    for idx, sym in enumerate(pairs, start=1):
         try:
-            df = fetch_ohlcv_range(ex, sym, tf, int(start_utc.timestamp()*1000), int(end_utc.timestamp()*1000))
-            if df.empty or len(df) < 100:
+            rows = ex.fetch_ohlcv(sym, timeframe=tf, limit=limit)
+            if not rows:
+                continue
+            df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            df = df.set_index("ts")
+            df = df.loc[start_ts:end_ts]
+            if len(df) < warmup_bars:
                 continue
             all_dfs[sym] = df
         except Exception as e:
-            # noisy exchanges / new listings, skip
-            # print(f"[data] {sym} err: {e}")
-            pass
-        if i % 20 == 0:
-            print(f"  pulled {i}/{len(symbols)}…")
+            print(f"[warn] ohlcv error {sym}: {e}")
 
-    if not all_dfs:
-        print("No data. Exiting.")
-        return
+        if idx % 20 == 0 or idx == n:
+            print(f"  pulled {idx}/{n}…")
 
-    # Create a common timeline (union of all indices) then reindex each df forward-fill (NA safe for ta)
-    common_idx = sorted(set().union(*[df.index for df in all_dfs.values()]))
-    common_idx = pd.DatetimeIndex(common_idx, tz="UTC")
-    # focus strictly on start..end boundaries (already fetched in range, but be safe)
-    common_idx = common_idx[(common_idx >= start_utc) & (common_idx <= end_utc)]
-    if len(common_idx) == 0:
-        print("No bars in window after alignment.")
-        return
+    print(f"[universe] {len(all_dfs)} pairs with sufficient history | tf={tf}")
+    return all_dfs
 
-    # Pre-compute rolling quote volume per symbol
-    rqv: Dict[str, pd.Series] = {}
-    for sym, df in all_dfs.items():
-        # reindex to common timeline, ffill ohlc as needed (volume NA -> 0)
-        dfr = df.reindex(common_idx).copy()
-        dfr[["open","high","low","close"]] = dfr[["open","high","low","close"]].ffill()
-        dfr["volume"] = dfr["volume"].fillna(0)
-        rqv[sym] = rolling_quote_volume(dfr, min_usd_vol_lookback)
+# ===== Trade simulation =====
+def simulate_symbol(sym: str, df: pd.DataFrame, tf: str) -> List[Dict[str, Any]]:
+    trades: List[Dict[str, Any]] = []
+    if len(df) < 120:
+        return trades
 
-    # Backtest state
-    OPEN: Dict[str, Dict] = {}  # sym -> trade dict
-    TRADES: List[Dict] = []
-    equity = 0.0
-    equity_curve = []
+    trade_open: Optional[Dict[str, Any]] = None
+    entry_idx: Optional[int] = None
 
-    print(f"[universe] {len(all_dfs)} pairs (movers-style) | tf={tf}")
-    print(f"[movers] building timeline over {len(common_idx)} bars… (this may take a bit)")
+    for i, (ts, row) in enumerate(df.iterrows()):
+        if i < 80:
+            continue
 
-    # Iterate over each bar (skip warmup bars)
-    warmup = max(80, min_usd_vol_lookback + 10)
-    for ts in common_idx[warmup:]:
-        # Build movers universe for this bar: top by rolling $volume >= min_usd_vol
-        current = []
-        for sym, df in all_dfs.items():
-            r = rqv[sym].reindex(common_idx).iloc[:common_idx.get_loc(ts)+1].iloc[-1]
-            if r is not None and r >= min_usd_vol:
-                current.append(sym)
-        # Optional cap
-        # current = current[:max_pairs]  # already capped earlier, but keep if needed
+        # 1) manage open trade using same priority logic as close_silent_if_hit
+        if trade_open is not None and entry_idx is not None and i > entry_idx:
+            lo = float(row["low"])
+            hi = float(row["high"])
+            stop = trade_open["stop"]
+            t1 = trade_open["t1"]
+            outcome = None
+            exit_price = None
 
-        # Generate/close per symbol
-        for sym in current:
-            dfr = all_dfs[sym].reindex(common_idx).loc[:ts].copy()
-            # Ensure no NA at the edge
-            dfr[["open","high","low","close"]] = dfr[["open","high","low","close"]].ffill()
-            dfr["volume"] = dfr["volume"].fillna(0)
+            # if both stop and t1 in same bar, count as t1 (favourable)
+            if (lo <= stop) and (t1 is not None and hi >= t1):
+                if hi >= t1:
+                    outcome, exit_price = "t1", t1
+                else:
+                    outcome, exit_price = "stop", stop
+            elif lo <= stop:
+                outcome, exit_price = "stop", stop
+            elif t1 is not None and hi >= t1:
+                outcome, exit_price = "t1", t1
 
-            # If trade is open, evaluate exit with this bar
-            if sym in OPEN:
-                tr = OPEN[sym]
-                # Use bar’s high/low to check TP/SL touch
-                hi = float(dfr.iloc[-1]["high"])
-                lo = float(dfr.iloc[-1]["low"])
-                hit = None; exit_px = None
-                # Check stop first (conservative)
-                if lo <= tr["stop"]:
-                    hit = "stop"; exit_px = tr["stop"]
-                # Check TP
-                if hit is None and hi >= tr["t1"]:
-                    hit = "t1"; exit_px = tr["t1"]
-                if hit:
-                    R = (exit_px - tr["entry"]) / max(1e-12, (tr["entry"] - tr["stop"]))
-                    TRADES.append({
-                        "symbol": sym, "opened_at": tr["opened_at"], "closed_at": ts.isoformat(),
-                        "entry": tr["entry"], "stop": tr["stop"], "t1": tr["t1"],
-                        "exit": exit_px, "outcome": hit, "r_multiple": R, "tf": tf, "type": "mover"
-                    })
-                    del OPEN[sym]
-                    equity += R
-
-            # If no open trade for this symbol, see if we have a fresh signal on this bar
-            if sym not in OPEN:
-                sig = mover_signal_1h(dfr)
-                if sig:
-                    entry = float(sig["entry"]); stop = float(sig["stop"]); t1 = float(sig["t1"])
-                    if entry <= 0 or stop <= 0 or stop >= entry:
-                        continue
-                    OPEN[sym] = {
-                        "entry": entry, "stop": stop, "t1": t1,
-                        "opened_at": ts.isoformat()
+            if outcome:
+                risk = trade_open["entry"] - trade_open["stop"]
+                r_mult = (exit_price - trade_open["entry"]) / risk if risk != 0 else 0.0
+                trades.append(
+                    {
+                        "symbol": sym,
+                        "timeframe": trade_open["timeframe"],
+                        "type": trade_open["type"],
+                        "open_time": trade_open["open_time"],
+                        "close_time": ts,
+                        "entry": trade_open["entry"],
+                        "stop": trade_open["stop"],
+                        "t1": trade_open["t1"],
+                        "exit_price": exit_price,
+                        "outcome": outcome,
+                        "r_multiple": r_mult,
+                        "hold_bars": i - entry_idx,
                     }
+                )
+                trade_open = None
+                entry_idx = None
+                # don't open a new trade on the same bar as exit
+                continue
 
-        # mark equity
-        equity_curve.append({"ts": ts.isoformat(), "equity_R": equity})
+        # 2) no open trade -> check for new signal using legacy_mover_signal on history up to this bar
+        if trade_open is None:
+            window = df.iloc[: i + 1]
+            sig = legacy_mover_signal(window)
+            if sig is not None:
+                trade_open = {
+                    "timeframe": tf,
+                    "type": sig["type"],
+                    "open_time": ts,
+                    "entry": sig["entry"],
+                    "stop": sig["stop"],
+                    "t1": sig["t1"],
+                }
+                entry_idx = i
 
-    # Close any still-open trades at the last close (mark as stop for conservative accounting)
-    last_ts = common_idx[-1]
-    for sym, tr in list(OPEN.items()):
-        TRADES.append({
-            "symbol": sym, "opened_at": tr["opened_at"], "closed_at": last_ts.isoformat(),
-            "entry": tr["entry"], "stop": tr["stop"], "t1": tr["t1"],
-            "exit": tr["stop"], "outcome": "stop", "r_multiple": (tr["stop"]-tr["entry"])/max(1e-12,(tr["entry"]-tr["stop"])),
-            "tf": tf, "type": "mover"
-        })
-        del OPEN[sym]
+    return trades
 
-    # ======= Stats =======
-    trades_df = pd.DataFrame(TRADES)
-    if trades_df.empty:
-        print("No trades generated.")
+# ===== Backtest runner =====
+def backtest(start: str, end: str, tf: str, cfg_path: Optional[str] = None):
+    cfg: Dict[str, Any] = {}
+    if cfg_path and os.path.exists(cfg_path):
+        with open(cfg_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+
+    extra_stables = cfg.get("filters", {}).get("extra_stables", [])
+
+    ex = ccxt.mexc({"enableRateLimit": True})
+
+    pairs = build_universe(
+        ex,
+        extra_stables=extra_stables,
+        min_usd_vol=2_000_000,
+        max_pairs=120,
+    )
+
+    all_dfs = fetch_all_ohlcv(
+        ex,
+        pairs,
+        tf=tf,
+        start=start,
+        end=end,
+        warmup_bars=120,
+    )
+
+    print("[movers] running legacy_mover_signal backtest…")
+    all_trades: List[Dict[str, Any]] = []
+    for sym, df in all_dfs.items():
+        sym_trades = simulate_symbol(sym, df, tf=tf)
+        all_trades.extend(sym_trades)
+
+    if not all_trades:
+        print("No trades generated in this window.")
         return
-    wins = (trades_df["r_multiple"] > 0).sum()
-    losses = (trades_df["r_multiple"] <= 0).sum()
-    win_rate = (wins / max(1, len(trades_df))) * 100.0
-    avgR = trades_df["r_multiple"].mean()
-    bestR = trades_df["r_multiple"].max()
-    worstR = trades_df["r_multiple"].min()
 
-    gains = trades_df.loc[trades_df["r_multiple"] > 0, "r_multiple"].sum()
-    losses_sum = -trades_df.loc[trades_df["r_multiple"] < 0, "r_multiple"].sum()
-    pf = (gains / losses_sum) if losses_sum > 0 else float("inf")
+    df_tr = pd.DataFrame(all_trades)
+    n = len(df_tr)
+    wins = (df_tr["r_multiple"] > 0).sum()
+    losses = (df_tr["r_multiple"] < 0).sum()
+    win_rate = wins / n * 100.0
+    avgR = df_tr["r_multiple"].mean()
+    bestR = df_tr["r_multiple"].max()
+    worstR = df_tr["r_multiple"].min()
 
-    # Max drawdown on equity_R
-    eq = pd.DataFrame(equity_curve)
-    eq["equity_R"] = eq["equity_R"].astype(float)
-    eq["peak"] = eq["equity_R"].cummax()
-    dd = eq["equity_R"] - eq["peak"]
+    gains = df_tr.loc[df_tr["r_multiple"] > 0, "r_multiple"].sum()
+    losses_sum = -df_tr.loc[df_tr["r_multiple"] < 0, "r_multiple"].sum()
+    pf = gains / losses_sum if losses_sum > 0 else float("inf")
+
+    eq = df_tr["r_multiple"].cumsum()
+    peak = eq.cummax()
+    dd = eq - peak
     max_dd = dd.min()
 
-    os.makedirs(out_dir, exist_ok=True)
-    trades_csv = os.path.join(out_dir, "movers_trades.csv")
-    eq_csv = os.path.join(out_dir, "movers_equity_curve.csv")
-    trades_df.to_csv(trades_csv, index=False)
-    eq.to_csv(eq_csv, index=False)
+    print("=== Backtest (Movers-only, legacy_mover_signal, TP+5% / swing-low stop) ===")
+    print(
+        f"Trades: {n} | Win%: {win_rate:.1f}% | Avg R: {avgR:.2f} | PF: {pf:.2f} | "
+        f"Best/Worst R: {bestR:.2f}/{worstR:.2f}"
+    )
+    print(f"Total R: {df_tr['r_multiple'].sum():.2f} | Max Drawdown: {max_dd:.2f} R")
 
-    print("=== Backtest (Movers-only, legacy breakout, TP+5% / swing-low stop) ===")
-    print(f"Trades: {len(trades_df)} | Win%: {win_rate:.1f}% | Avg R: {avgR:.2f} | PF: {pf if pf!=float('inf') else 'inf'} | Best/Worst R: {bestR:.2f}/{worstR:.2f}")
-    print(f"Total R: {trades_df['r_multiple'].sum():.2f} | Max Drawdown: {max_dd:.2f} R")
-    print(f"[saved] {trades_csv} and {eq_csv}")
+    os.makedirs("./backtest_out", exist_ok=True)
+    out_trades = "./backtest_out/movers_trades.csv"
+    out_eq = "./backtest_out/movers_equity_curve.csv"
+    df_tr.to_csv(out_trades, index=False)
+    eq_df = pd.DataFrame({"trade_idx": range(1, n + 1), "equity_R": eq})
+    eq_df.to_csv(out_eq, index=False)
+    print(f"[saved] {out_trades} and {out_eq}")
 
-# ================ CLI =================
+# ===== CLI =====
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", required=True, help="UTC start, e.g. 2025-07-01")
-    ap.add_argument("--end", required=True, help="UTC end, e.g. 2025-10-29")
-    ap.add_argument("--tf", default="1h", choices=["1h","4h"], help="timeframe (1h recommended for movers)")
-    ap.add_argument("--min_usd_vol", type=float, default=2_000_000.0, help="rolling 24-bar $ volume threshold")
-    ap.add_argument("--max_pairs", type=int, default=120, help="cap number of pairs to track")
+    ap.add_argument("--config", default=None, help="Path to mexc_trader_bot_config.yml (optional)")
+    ap.add_argument("--start", required=True, help="Backtest start date (YYYY-MM-DD)")
+    ap.add_argument("--end", required=True, help="Backtest end date (YYYY-MM-DD)")
+    ap.add_argument("--tf", default="1h", help="Timeframe (default 1h)")
     args = ap.parse_args()
 
-    backtest_movers(
-        start=args.start,
-        end=args.end,
-        tf=args.tf,
-        min_usd_vol_lookback=24 if args.tf=="1h" else 6,  # ~24h window
-        min_usd_vol=args.min_usd_vol,
-        max_pairs=args.max_pairs,
-        extra_stables=[],
-        out_dir="./backtest_out"
-    )
+    backtest(start=args.start, end=args.end, tf=args.tf, cfg_path=args.config)
 
 if __name__ == "__main__":
     main()
