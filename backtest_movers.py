@@ -162,7 +162,7 @@ def backtest_movers(
 
     # Pre-compute rolling quote volume per symbol
     rqv: Dict[str, pd.Series] = {}
-    for sym, df in all_dfs.items]:
+    for sym, df in all_dfs.items():
         # reindex to common timeline, ffill ohlc as needed (volume NA -> 0)
         dfr = df.reindex(common_idx).copy()
         dfr[["open","high","low","close"]] = dfr[["open","high","low","close"]].ffill()
