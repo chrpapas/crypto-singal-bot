@@ -76,7 +76,7 @@ movers:
 
 # ========= ETH gate (Top-100 / movers bullish entries only) =========
 eth_gate:
-  enabled: true          # was false
+  enabled: false          # was false
   timeframe: "4h"        # use 4h ETH regime for 4h signals
   require_ema_stack: true    # ETH ema20 > ema50
   min_rsi: 52            # ETH RSI must be at least 52
