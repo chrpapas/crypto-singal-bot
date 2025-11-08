@@ -364,6 +364,14 @@ def bear_still_valid(df: pd.DataFrame, cfg: Dict[str,Any]) -> bool:
     return True
 
 def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
+    """
+    Evaluate all open silent signals and close them if stop/T1/T2 (or bear invalidate) is hit.
+    Also logs:
+      - time_to_outcome_min
+      - time_to_t1_min
+      - time_to_t2_min
+    in minutes, based on OHLCV timestamps (not bot runtime).
+    """
     book = rds.load_json("state","silent_open", default={})
     if not book:
         return
@@ -386,10 +394,15 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
                 limit = 260 if tf == "1h" else (400 if tf == "4h" else 320)
                 df = client.ohlcv(underlying, tf, limit)
                 if not bear_still_valid(df, cfg.get("bearish_signals", {})):
+                    hit_ts = df.index[-1]
                     tr["status"]     = "closed"
-                    tr["closed_at"]  = df.index[-1].isoformat()
+                    tr["closed_at"]  = hit_ts.isoformat()
                     tr["outcome"]    = "invalidated"
                     tr["exit_price"] = float(df["close"].iloc[-1])
+
+                    opened_at = pd.to_datetime(tr.get("opened_at"), utc=True)
+                    tr["time_to_outcome_min"] = float((hit_ts - opened_at).total_seconds() / 60.0)
+
                     book[k] = tr
                     changed = True
             except Exception as e:
@@ -400,40 +413,67 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
         try:
             limit = 400 if tf in ("1h", "4h") else 330
             df = client.ohlcv(pair, tf, limit)
-            since = pd.to_datetime(tr["opened_at"], utc=True)
-            df = df.loc[since:]
-            rows = df.iloc[1:]
+            opened_at = pd.to_datetime(tr["opened_at"], utc=True)
+            df = df.loc[opened_at:]
+            rows = df.iloc[1:]  # bars after signal bar
 
             outcome = None
             price   = None
+            hit_ts  = None
 
-            for _, r in rows.iterrows():
+            # first time T1 is ever touched (even if we later hit T2)
+            t1_ts = None
+
+            for ts, r in rows.iterrows():
                 lo, hi = float(r["low"]), float(r["high"])
+
+                # track first touch of T1
+                if t1 is not None and hi >= t1 and t1_ts is None:
+                    t1_ts = ts
 
                 # both stop and targets in same candle -> optimistic ordering
                 if stop is not None and lo <= stop and t2 is not None and hi >= t2:
-                    outcome, price = "t2", t2
+                    outcome, price, hit_ts = "t2", t2, ts
                     break
                 if stop is not None and lo <= stop and t1 is not None and hi >= t1:
-                    outcome, price = "t1", t1
+                    outcome, price, hit_ts = "t1", t1, ts
                     break
 
                 # simple cases
                 if stop is not None and lo <= stop:
-                    outcome, price = "stop", stop
+                    outcome, price, hit_ts = "stop", stop, ts
                     break
                 if t2 is not None and hi >= t2:
-                    outcome, price = "t2", t2
+                    outcome, price, hit_ts = "t2", t2, ts
                     break
                 if t1 is not None and hi >= t1:
-                    outcome, price = "t1", t1
+                    outcome, price, hit_ts = "t1", t1, ts
                     break
 
             if outcome:
                 tr["status"]     = "closed"
-                tr["closed_at"]  = df.index[-1].isoformat()
+                tr["closed_at"]  = hit_ts.isoformat() if hit_ts is not None else df.index[-1].isoformat()
                 tr["outcome"]    = outcome      # "t1", "t2" or "stop"
                 tr["exit_price"] = float(price)
+
+                # timing metrics
+                if hit_ts is not None:
+                    dt_outcome = (hit_ts - opened_at).total_seconds() / 60.0
+                    tr["time_to_outcome_min"] = float(dt_outcome)
+                else:
+                    tr["time_to_outcome_min"] = None
+
+                if t1_ts is not None:
+                    dt_t1 = (t1_ts - opened_at).total_seconds() / 60.0
+                    tr["time_to_t1_min"] = float(dt_t1)
+                else:
+                    tr["time_to_t1_min"] = None
+
+                if outcome == "t2" and hit_ts is not None:
+                    dt_t2 = (hit_ts - opened_at).total_seconds() / 60.0
+                    tr["time_to_t2_min"] = float(dt_t2)
+                else:
+                    tr["time_to_t2_min"] = None
 
                 # optional: compute R multiple
                 try:
@@ -592,6 +632,80 @@ def movers_stats_table(rds: RedisState):
     print(f"  • T2 hits         : {n_t2}      ({pct(n_t2):5.1f}%)")
     print(f"Losses (Stop)       : {n_stop}    ({pct(n_stop):5.1f}%)")
     print("-------------------------------------------------")
+
+def movers_time_stats_table(rds: RedisState):
+    """
+    Time-to-target stats for Movers signals.
+    Relies on fields populated in close_silent_if_hit:
+      - time_to_outcome_min
+      - time_to_t1_min
+      - time_to_t2_min
+    """
+    book = rds.load_json("state", "silent_open", default={})
+
+    movers = [
+        tr for tr in book.values()
+        if tr.get("source") == "movers" and tr.get("status") == "closed"
+    ]
+    if not movers:
+        print("--- Movers Time Stats: no closed movers trades yet ---")
+        return
+
+    def _clean(values):
+        return [float(v) for v in values if v is not None]
+
+    # any closed trade where outcome is t1 or t2
+    t1_any = _clean(
+        tr.get("time_to_t1_min")
+        for tr in movers
+        if tr.get("outcome") in ("t1", "t2")
+    )
+
+    # trades whose final outcome is t2
+    t2_only = _clean(
+        tr.get("time_to_t2_min")
+        for tr in movers
+        if tr.get("outcome") == "t2"
+    )
+
+    # time to first outcome (t1/t2/stop) for all movers
+    outcome_any = _clean(
+        tr.get("time_to_outcome_min")
+        for tr in movers
+    )
+
+    if not (t1_any or t2_only or outcome_any):
+        print("--- Movers Time Stats: no timing data yet ---")
+        return
+
+    def _stats(arr):
+        if not arr:
+            return None
+        a = np.array(arr, dtype=float)
+        return {
+            "n": len(a),
+            "min": float(a.min()),
+            "max": float(a.max()),
+            "mean": float(a.mean()),
+            "median": float(np.median(a)),
+        }
+
+    def _fmt_block(title, st):
+        if not st:
+            print(f"{title}: no samples")
+            return
+        def _h(m): return m / 60.0  # minutes -> hours
+        print(f"{title}: n={st['n']}")
+        print(f"  • min    : {st['min']:.1f} min  ({_h(st['min']):.2f} h)")
+        print(f"  • median : {st['median']:.1f} min  ({_h(st['median']):.2f} h)")
+        print(f"  • mean   : {st['mean']:.1f} min  ({_h(st['mean']):.2f} h)")
+        print(f"  • max    : {st['max']:.1f} min  ({_h(st['max']):.2f} h)")
+
+    print("--- Movers Time-To-Target Stats ---")
+    _fmt_block("Time to first outcome (T1/T2/Stop)", _stats(outcome_any))
+    _fmt_block("Time to T1 (for trades that touched T1)", _stats(t1_any))
+    _fmt_block("Time to T2 (for T2 winners only)", _stats(t2_only))
+    print("-----------------------------------")
 
 # =============== Fallback universe (top USDT-volume) ===============
 def mexc_top_usdt_volume_pairs(client: ExClient, *, max_pairs=60, min_usd_vol=2_000_000, extra_stables=None):
@@ -887,6 +1001,7 @@ def run(cfg: Dict[str,Any]):
     # ======== Evaluate/close silent signals ========
     close_silent_if_hit(rds, client, cfg)
     movers_stats_table(rds)
+    movers_time_stats_table(rds)
 
     # ======== Logs ========
     print(f"=== MEXC Signals @ {pd.Timestamp.utcnow().isoformat()} ===")
