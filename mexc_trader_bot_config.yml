@@ -1,3 +1,6 @@
+reporting:
+  movers_detailed_max_rows: 100
+
 # ========= Persistence =========
 persistence:
   redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"   # or use REDIS_URL env
