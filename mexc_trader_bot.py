@@ -365,45 +365,97 @@ def bear_still_valid(df: pd.DataFrame, cfg: Dict[str,Any]) -> bool:
 
 def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str,Any]):
     book = rds.load_json("state","silent_open", default={})
-    if not book: return
+    if not book:
+        return
     changed = False
+
     for k, tr in list(book.items()):
-        if tr.get("status")!="open": continue
-        pair = tr["symbol"]; tf = tr["tf"]; stop = tr.get("stop"); t1 = tr.get("t1")
+        if tr.get("status") != "open":
+            continue
+
+        pair = tr["symbol"]
+        tf   = tr["tf"]
+        stop = tr.get("stop")
+        t1   = tr.get("t1")
+        t2   = tr.get("t2")
+
+        # ----- Bear trades -----
         if tr.get("type", "").startswith("bear"):
             underlying = tr.get("underlying") or pair
             try:
                 limit = 260 if tf == "1h" else (400 if tf == "4h" else 320)
                 df = client.ohlcv(underlying, tf, limit)
                 if not bear_still_valid(df, cfg.get("bearish_signals", {})):
-                    tr["status"]="closed"; tr["closed_at"]=df.index[-1].isoformat()
-                    tr["outcome"]="invalidated"; tr["exit_price"]=float(df["close"].iloc[-1])
-                    book[k]=tr; changed=True
+                    tr["status"]     = "closed"
+                    tr["closed_at"]  = df.index[-1].isoformat()
+                    tr["outcome"]    = "invalidated"
+                    tr["exit_price"] = float(df["close"].iloc[-1])
+                    book[k] = tr
+                    changed = True
             except Exception as e:
                 print("[silent-bear] eval err", underlying, tf, e)
             continue
+
+        # ----- Normal bullish trades (Top100 / Movers) -----
         try:
-            limit = 400 if tf in ("1h","4h") else 330
+            limit = 400 if tf in ("1h", "4h") else 330
             df = client.ohlcv(pair, tf, limit)
             since = pd.to_datetime(tr["opened_at"], utc=True)
             df = df.loc[since:]
             rows = df.iloc[1:]
-            outcome=None; price=None
-            for _,r in rows.iterrows():
+
+            outcome = None
+            price   = None
+
+            for _, r in rows.iterrows():
                 lo, hi = float(r["low"]), float(r["high"])
-                if (stop is not None and lo <= stop) and (t1 is not None and hi >= t1):
-                    outcome, price = "t1", t1; break
+
+                # both stop and targets in same candle -> optimistic ordering
+                if stop is not None and lo <= stop and t2 is not None and hi >= t2:
+                    outcome, price = "t2", t2
+                    break
+                if stop is not None and lo <= stop and t1 is not None and hi >= t1:
+                    outcome, price = "t1", t1
+                    break
+
+                # simple cases
                 if stop is not None and lo <= stop:
-                    outcome, price = "stop", stop; break
+                    outcome, price = "stop", stop
+                    break
+                if t2 is not None and hi >= t2:
+                    outcome, price = "t2", t2
+                    break
                 if t1 is not None and hi >= t1:
-                    outcome, price = "t1", t1; break
+                    outcome, price = "t1", t1
+                    break
+
             if outcome:
-                tr["status"]="closed"; tr["closed_at"]=df.index[-1].isoformat(); tr["outcome"]=outcome; tr["exit_price"]=float(price)
-                book[k]=tr; changed=True
+                tr["status"]     = "closed"
+                tr["closed_at"]  = df.index[-1].isoformat()
+                tr["outcome"]    = outcome      # "t1", "t2" or "stop"
+                tr["exit_price"] = float(price)
+
+                # optional: compute R multiple
+                try:
+                    entry    = float(tr.get("entry"))
+                    stop_val = tr.get("stop")
+                    if stop_val is not None:
+                        stop_val = float(stop_val)
+                        risk     = max(1e-9, entry - stop_val)
+                        tr["R"]  = (tr["exit_price"] - entry) / risk
+                    else:
+                        tr["R"]  = None
+                except Exception:
+                    tr["R"] = None
+
+                book[k] = tr
+                changed = True
+
         except Exception as e:
             print("[silent] eval err", pair, tf, e)
+
     if changed:
-        rds.save_json(book, "state","silent_open")
+        rds.save_json(book, "state", "silent_open")
 
 def silent_dashboard(rds: RedisState):
     book = rds.load_json("state","silent_open", default={})
@@ -432,7 +484,7 @@ def silent_dashboard(rds: RedisState):
         else:
             by.setdefault(bucket, {"open":0,"closed":0,"wins":0})
             by[bucket]["closed"] += 1
-            if tr.get("outcome") in ("t1","bear_exit_win"):
+            if tr.get("outcome") in ("t1","t2","bear_exit_win"):
                 by[bucket]["wins"] += 1
     print("--- Silent Signal Performance (since reset) ---")
     def line(name,k):
@@ -512,6 +564,34 @@ def eth_gate_ok(client: ExClient, tf: str, cfg: Dict[str,Any]) -> Optional[bool]
         return bool(ok)
     except Exception:
         return None
+
+# =============== Movers stats helper ===============
+def movers_stats_table(rds: RedisState):
+    book = rds.load_json("state","silent_open", default={})
+    movers = [
+        tr for tr in book.values()
+        if tr.get("source") == "movers" and tr.get("status") == "closed"
+    ]
+    n = len(movers)
+    if n == 0:
+        print("--- Movers Performance: no closed trades yet ---")
+        return
+
+    n_t1   = sum(1 for tr in movers if tr.get("outcome") == "t1")
+    n_t2   = sum(1 for tr in movers if tr.get("outcome") == "t2")
+    n_stop = sum(1 for tr in movers if tr.get("outcome") == "stop")
+
+    win_total = n_t1 + n_t2
+
+    def pct(x): return (x / n) * 100.0 if n else 0.0
+
+    print("--- Movers Performance (Signals Source = 'movers') ---")
+    print(f"Total closed trades : {n}")
+    print(f"Wins (T1 or T2)     : {win_total}  ({pct(win_total):5.1f}%)")
+    print(f"  • T1 only         : {n_t1}      ({pct(n_t1):5.1f}%)")
+    print(f"  • T2 hits         : {n_t2}      ({pct(n_t2):5.1f}%)")
+    print(f"Losses (Stop)       : {n_stop}    ({pct(n_stop):5.1f}%)")
+    print("-------------------------------------------------")
 
 # =============== Fallback universe (top USDT-volume) ===============
 def mexc_top_usdt_volume_pairs(client: ExClient, *, max_pairs=60, min_usd_vol=2_000_000, extra_stables=None):
@@ -806,6 +886,7 @@ def run(cfg: Dict[str,Any]):
 
     # ======== Evaluate/close silent signals ========
     close_silent_if_hit(rds, client, cfg)
+    movers_stats_table(rds)
 
     # ======== Logs ========
     print(f"=== MEXC Signals @ {pd.Timestamp.utcnow().isoformat()} ===")
