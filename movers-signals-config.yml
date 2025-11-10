@@ -40,7 +40,7 @@ movers:
   min_volume_usd_24h: 5000000
 
   # Maximum coin age in days (since listing on CMC)
-  max_age_days: 365
+  max_age_days: 3650
 
   # Quote asset you trade/scan on MEXC
   quote: "USDT"
