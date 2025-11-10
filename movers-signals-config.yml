@@ -1,0 +1,61 @@
+# mexc_movers_bot_config.yml
+# Config for: mexc_movers_bot.py  (Movers-only, Discord signals, Redis stats)
+
+persistence:
+  # If you leave this as ${REDIS_URL}, the script will read the actual URL
+  # from your environment variable REDIS_URL.
+  redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
+  key_prefix: kritocurrency:movers:v1
+  # How long Redis keys live (in minutes). 2880 = 2 days.
+  ttl_minutes: 2880
+
+discord:
+  # Webhook for your "movers-signals" channel on the
+  # Kritocurrency Alpha Signals server.
+  # You can either paste the full URL here or keep ${DISCORD_SIGNALS_WEBHOOK}
+  # and set it in the environment.
+  signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}
+
+filters:
+  # Extra stables to exclude if they appear as base assets.
+  extra_stables:
+    - EUR
+    - EURS
+    - TRY
+    - BRL
+
+movers:
+  enabled: true
+
+  # CMC API key (can also be provided via env: CMC_API_KEY)
+  cmc_api_key: ${CMC_API_KEY}
+
+  # How many listings to pull from CMC
+  limit: 500
+
+  # Minimum 24h percent change to consider something a "mover"
+  min_change_24h: 15.0
+
+  # Minimum 24h USD volume
+  min_volume_usd_24h: 5000000
+
+  # Maximum coin age in days (since listing on CMC)
+  max_age_days: 365
+
+  # Quote asset you trade/scan on MEXC
+  quote: "USDT"
+
+fallback:
+  # If CMC movers result in zero mapped pairs on MEXC,
+  # fall back to the top USDT-volume universe on MEXC.
+  enabled: false
+
+  # Minimum quote volume (approx USD) for a pair to be included
+  min_usd_vol: 2000000
+
+  # Max number of fallback pairs
+  max_pairs: 80
+
+reporting:
+  # Max number of closed Movers trades shown in the detailed table each run
+  movers_detailed_max_rows: 100
