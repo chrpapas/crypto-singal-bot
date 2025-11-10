@@ -5,7 +5,7 @@ persistence:
   # If you leave this as ${REDIS_URL}, the script will read the actual URL
   # from your environment variable REDIS_URL.
   redis_url: "rediss://default:ASpEAAIncDI3NDk5ODUzMzg0MWE0MDE5YjQxNjE4ODE3Yjk1NjdlN3AyMTA4MjA@polished-jackass-10820.upstash.io:6379"
-  key_prefix: kritocurrency:movers:v1
+  key_prefix: spideybot:v1
   # How long Redis keys live (in minutes). 2880 = 2 days.
   ttl_minutes: 2880
 
