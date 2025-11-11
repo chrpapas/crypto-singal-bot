@@ -690,7 +690,6 @@ def run(cfg: Dict[str, Any]):
     close_silent_if_hit(rds, client, cfg)
     movers_stats_table(rds)
     movers_time_stats_table(rds)
-    movers_detailed_table(rds, max_rows=movers_max_rows)
 
     # ======== Logs ========
     print(f"=== Movers scan done @ {pd.Timestamp.utcnow().isoformat()} ===")
