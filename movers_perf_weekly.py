@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import argparse
 import datetime
 import pandas as pd
@@ -12,108 +14,112 @@ from perf_common import (
 )
 
 
-def summarize(trades):
-    """Return (n, win_count, stop_count, win_rate_pct, cum_R)."""
-    n = len(trades)
-    wins = [t for t in trades if t.get("outcome") in ("t1", "t2")]
-    stops = [t for t in trades if t.get("outcome") == "stop"]
-    Rs = [float(t["R"]) for t in trades if t.get("R") is not None]
-    cum_R = sum(Rs) if Rs else 0.0
-    win_rate = (len(wins) / n * 100.0) if n > 0 else 0.0
-    return n, len(wins), len(stops), win_rate, cum_R
-
-
-def fmt_trade_line(t):
-    """Format a single trade row for Discord."""
-    sym = t.get("symbol", "?")
-    outcome = (t.get("outcome") or "").upper()
-    R = t.get("R")
-    R_txt = f"{float(R):+0.2f}R" if R is not None else "n/a"
-    mins = float(t.get("time_to_outcome_min") or 0.0)
-    hours = mins / 60.0
-    closed_at = t.get("closed_at", "")[:19]
-    return f"- `{sym}` — {outcome} — {R_txt} — {hours:.1f}h — closed {closed_at} UTC"
-
-
 def run(cfg):
     print("[weekly] Starting weekly movers performance recap...")
+
+    # Discord + Redis init (Redis already done in main, but harmless if repeated)
     hook = init_discord_from_config(cfg)
-    _ = init_redis_from_config(cfg)
 
     trades = load_trades()
     if not trades:
-        print("[weekly] No closed trades found in Redis.")
-        post_discord(hook, "📊 No closed trades yet.")
+        print("[weekly] No closed trades found at all. Skipping.")
+        post_discord(hook, "📅 Weekly recap: no closed trades yet.")
         return
 
     today = datetime.datetime.utcnow().date()
-    week_start = today - datetime.timedelta(days=6)  # last 7 days inclusive
-    week_end = today
+    week_start = today - datetime.timedelta(days=7)
 
-    weekly_trades = []
-    for t in trades:
-        ca = t.get("closed_at")
-        if not ca:
-            continue
-        d = pd.to_datetime(ca).date()
-        if week_start <= d <= week_end:
-            weekly_trades.append(t)
+    weekly_trades = [
+        t
+        for t in trades
+        if t.get("closed_at")
+        and week_start <= pd.to_datetime(t["closed_at"]).date() <= today
+    ]
 
     if not weekly_trades:
-        print(f"[weekly] No trades closed between {week_start} and {week_end}.")
+        print("[weekly] No trades closed in the last 7 days.")
         post_discord(
             hook,
-            f"📊 **Weekly Movers Recap — {week_start.isoformat()} → {week_end.isoformat()}**\nNo trades closed this week."
+            f"📅 **Weekly Movers Recap — {week_start.isoformat()} → {today.isoformat()}**\n"
+            "No trades were closed this week."
         )
         return
 
-    # ---- Weekly stats ----
-    n_week, wins_week, stops_week, win_rate_week, cum_R_week = summarize(weekly_trades)
+    print(f"[weekly] Found {len(weekly_trades)} trades closed this week.")
 
-    # ---- Lifetime stats ----
-    n_all, wins_all, stops_all, win_rate_all, cum_R_all = summarize(trades)
+    # Lifetime stats (all closed movers)
+    total_closed = len(trades)
+    print(f"[weekly] Lifetime closed trades: {total_closed}")
 
-    print(f"[weekly] Found {n_week} trades closed this week.")
-    print(f"[weekly] Lifetime closed trades: {n_all}")
+    weekly_wins = [t for t in weekly_trades if t.get("outcome") in ("t1", "t2")]
+    weekly_stops = [t for t in weekly_trades if t.get("outcome") == "stop"]
 
-    trades_with_R = [t for t in weekly_trades if t.get("R") is not None]
-    if trades_with_R:
-        best = max(trades_with_R, key=lambda t: t.get("R", 0))
-        worst = min(trades_with_R, key=lambda t: t.get("R", 0))
-        best_txt = f"`{best['symbol']}` {best['R']:+.2f}R"
-        worst_txt = f"`{worst['symbol']}` {worst['R']:+.2f}R"
-    else:
-        best_txt = "n/a"
-        worst_txt = "n/a"
+    weekly_win_rate = (len(weekly_wins) / len(weekly_trades)) * 100 if weekly_trades else 0.0
 
-    trade_lines = [fmt_trade_line(t) for t in weekly_trades]
+    weekly_Rs = [float(t["R"]) for t in weekly_trades if t.get("R") is not None]
+    weekly_cum_R = sum(weekly_Rs) if weekly_Rs else 0.0
 
-    msg = f"""📊 **Weekly Movers Recap — {week_start.isoformat()} → {week_end.isoformat()}**
+    lifetime_wins = [t for t in trades if t.get("outcome") in ("t1", "t2")]
+    lifetime_Rs = [float(t["R"]) for t in trades if t.get("R") is not None]
+    lifetime_win_rate = (len(lifetime_wins) / total_closed) * 100 if total_closed else 0.0
+    lifetime_cum_R = sum(lifetime_Rs) if lifetime_Rs else 0.0
 
-**This week**
-• Closed: **{n_week}**  
-• Wins: **{wins_week}** | Stops: **{stops_week}**  
-• Win rate: **{win_rate_week:.1f}%**  
-• Total: **{cum_R_week:+.2f}R**  
-• Best: {best_txt} | Worst: {worst_txt}
+    # Best / worst this week (by R)
+    best_week = max(
+        weekly_trades,
+        key=lambda t: (t.get("R") if t.get("R") is not None else -9999),
+    )
+    worst_week = min(
+        weekly_trades,
+        key=lambda t: (t.get("R") if t.get("R") is not None else 9999),
+    )
 
-**Since tracking began**
-• Closed: **{n_all}**  
-• Wins: **{wins_all}** | Stops: **{stops_all}**  
-• Win rate: **{win_rate_all:.1f}%**  
-• Total: **{cum_R_all:+.2f}R**
+    # ---- Build a compact, line-based message ----
+    header = (
+        f"📅 **Weekly Movers Recap — {week_start.isoformat()} → {today.isoformat()}**\n"
+        f"Closed: **{len(weekly_trades)}** | Wins: **{len(weekly_wins)}** | Stops: **{len(weekly_stops)}**\n"
+        f"Week PnL: **{weekly_cum_R:+.2f}R** | Win rate: **{weekly_win_rate:.1f}%**\n"
+        f"Best: `{best_week['symbol']}` {best_week.get('R', 0):+.2f}R | "
+        f"Worst: `{worst_week['symbol']}` {worst_week.get('R', 0):+.2f}R\n"
+        "━━━━━━━━━━━━━━\n"
+        f"**Lifetime (all closed Movers trades)**\n"
+        f"Total closed: **{total_closed}** | Win rate: **{lifetime_win_rate:.1f}%** | "
+        f"Cumulative: **{lifetime_cum_R:+.2f}R**\n"
+        "━━━━━━━━━━━━━━\n"
+        "**All trades closed this week:**"
+    )
 
-**All trades closed this week**
-""" + "\n".join(trade_lines)
+    # Per-trade lines — short & consistent so chunking in perf_common works well
+    lines = []
+    for t in weekly_trades:
+        sym = t.get("symbol", "?")
+        outcome = (t.get("outcome") or "").upper()
+        R = t.get("R")
+        R_txt = f"{float(R):+.2f}R" if R is not None else "n/a"
+        mins = float(t.get("time_to_outcome_min", 0) or 0)
+        hours = mins / 60.0
+        closed_at = t.get("closed_at", "")[:16]  # trim for brevity YYYY-MM-DDTHH:MM
+
+        line = (
+            f"• {sym} — {outcome} — {R_txt} — {hours:.1f}h — closed {closed_at}"
+        )
+        lines.append(line)
+
+    body = "\n".join(lines)
+
+    full_msg = header + "\n" + body
 
     print("[weekly] Sending Discord weekly recap…")
-    post_discord(hook, msg)
+    post_discord(hook, full_msg)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="mexc_movers_bot_config.yml")
+    ap.add_argument("--config", default="movers-signals-config.yml")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    # Ensure Redis is initialized before load_trades()
+    init_redis_from_config(cfg)
+
     run(cfg)
