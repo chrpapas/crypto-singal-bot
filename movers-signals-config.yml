@@ -34,7 +34,7 @@ movers:
   limit: 500
 
   # Minimum 24h percent change to consider something a "mover"
-  min_change_24h: 15.0
+  min_change_24h: 8.0
 
   # Minimum 24h USD volume
   min_volume_usd_24h: 5000000
