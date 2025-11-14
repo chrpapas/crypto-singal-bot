@@ -18,6 +18,12 @@ discord:
   performance_webhook: ${DISCORD_PERFORMANCE_WEBHOOK}  # for perf scripts
   delayed_webhook: ${DISCORD_DELAYED_WEBHOOK}
 
+delayed_signals:
+  webhook: ${DISCORD_DELAYED_WEBHOOK}  # your delayed channel webhook
+  min_delay_minutes: 240               # 4h delay
+  max_age_days: 14                     # only last 2 weeks
+  max_previews_per_run: 5              # prevent spam
+  
 filters:
   # Extra stables to exclude if they appear as base assets.
   extra_stables:
