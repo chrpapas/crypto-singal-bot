@@ -9,13 +9,13 @@ mexc_movers_bot.py — Movers-only scanner with:
 - Discord: Movers signals only (no MEXC mention in message)
 
 ENV (optional):
-  REDIS_URL, DISCORD_SIGNALS_WEBHOOK, CMC_API_KEY, MEXC_API_KEY, MEXC_SECRET
+  REDIS_URL, DISCORD_SIGNALS_WEBHOOK, CMC_API_KEY
 
 Run:
   python3 mexc_movers_bot.py --config mexc_movers_bot_config.yml
 """
 
-import argparse, json, os, yaml, requests, math
+import argparse, json, os, yaml, requests
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
@@ -216,13 +216,12 @@ def legacy_mover_signal(df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     entry = float(last["close"])
     stop = float(min(df1h["low"].iloc[-10:]))
 
-    # keep raw floats; don't round t1/t2 here
     return {
         "type": "day",
         "entry": entry,
         "stop": stop,
-        "t1": entry * 1.05,   # +5%
-        "t2": entry * 1.10,   # +10%
+        "t1": round(entry * 1.05, 6),  # +5%
+        "t2": round(entry * 1.10, 6),  # +10%
         "level": float(hl),
         "note": "Mover Trend",
         "event_bar_ts": df1h.index[-1].isoformat(),
@@ -254,7 +253,6 @@ def is_silent_open_movers(rds: RedisState, symbol: str, tf: str, typ: str) -> bo
     book = rds.load_json("state", "silent_open", default={})
     return silent_key(symbol, tf, typ, "movers") in book
 
-# =============== Evaluation / Close ===============
 def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
     """
     Evaluate all open silent signals and close them if stop/T1/T2 is hit.
@@ -279,6 +277,7 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
         t1 = tr.get("t1")
         t2 = tr.get("t2")
 
+        # Movers only: no bear logic here
         try:
             limit = 400 if tf in ("1h", "4h") else 330
             df = client.ohlcv(pair, tf, limit)
@@ -366,7 +365,6 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
     if changed:
         rds.save_json(book, "state", "silent_open")
 
-# =============== Performance tables ===============
 def movers_stats_table(rds: RedisState):
     book = rds.load_json("state", "silent_open", default={})
     movers = [
@@ -395,6 +393,13 @@ def movers_stats_table(rds: RedisState):
     print("-------------------------------------------------")
 
 def movers_time_stats_table(rds: RedisState):
+    """
+    Time-to-target stats for Movers signals.
+
+    Uses:
+      - time_to_outcome_min when available
+      - otherwise falls back to (closed_at - opened_at) if both are present
+    """
     book = rds.load_json("state", "silent_open", default={})
 
     movers = [
@@ -405,6 +410,33 @@ def movers_time_stats_table(rds: RedisState):
         print("--- Movers Time Stats: no closed movers trades yet ---")
         return
 
+    def _effective_outcome_minutes(tr):
+        v = tr.get("time_to_outcome_min")
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                return None
+        # fallback: derive from opened_at / closed_at
+        oa = tr.get("opened_at")
+        ca = tr.get("closed_at")
+        if not oa or not ca:
+            return None
+        try:
+            oa_dt = pd.to_datetime(oa, utc=True)
+            ca_dt = pd.to_datetime(ca, utc=True)
+            return float((ca_dt - oa_dt).total_seconds() / 60.0)
+        except Exception:
+            return None
+
+    # any closed trade where outcome is t1 or t2 or stop
+    outcome_any = [
+        _effective_outcome_minutes(tr)
+        for tr in movers
+    ]
+    outcome_any = [v for v in outcome_any if v is not None]
+
+    # For T1/T2 we still rely only on explicit timing fields
     def _clean(values):
         return [float(v) for v in values if v is not None]
 
@@ -418,11 +450,6 @@ def movers_time_stats_table(rds: RedisState):
         tr.get("time_to_t2_min")
         for tr in movers
         if tr.get("outcome") == "t2"
-    )
-
-    outcome_any = _clean(
-        tr.get("time_to_outcome_min")
-        for tr in movers
     )
 
     if not (t1_any or t2_only or outcome_any):
@@ -449,10 +476,10 @@ def movers_time_stats_table(rds: RedisState):
         def _h(m): return m / 60.0
 
         print(f"{title}: n={st['n']}")
-        print(f"  • min    : {st['min']:.1f} min  ({_h(st['min']):2.2f} h)")
-        print(f"  • median : {st['median']:.1f} min  ({_h(st['median']):2.2f} h)")
-        print(f"  • mean   : {st['mean']:.1f} min  ({_h(st['mean']):2.2f} h)")
-        print(f"  • max    : {st['max']:.1f} min  ({_h(st['max']):2.2f} h)")
+        print(f"  • min    : {st['min']:.1f} min  ({_h(st['min']):.2f} h)")
+        print(f"  • median : {st['median']:.1f} min  ({_h(st['median']):.2f} h)")
+        print(f"  • mean   : {st['mean']:.1f} min  ({_h(st['mean']):.2f} h)")
+        print(f"  • max    : {st['max']:.1f} min  ({_h(st['max']):.2f} h)")
 
     print("--- Movers Time-To-Target Stats ---")
     _fmt_block("Time to first outcome (T1/T2/Stop)", _stats(outcome_any))
@@ -589,151 +616,80 @@ def _post_discord(hook: str, text: str):
     if not hook or not text.strip():
         return
     try:
-        requests.post(hook, json={"content": text}, timeout=10)
+        resp = requests.post(hook, json={"content": text}, timeout=10)
+        if resp.status_code >= 300:
+            print(f"[discord] post err: HTTP {resp.status_code} {resp.text}")
     except Exception as e:
         print("[discord] post err:", e)
 
-# ---- adaptive formatting helpers ----
-def _market_price_decimals(client: ExClient, symbol: str) -> Optional[int]:
-    """
-    Try to derive the exchange's price precision (decimals) from CCXT markets data.
-    Returns None if unavailable.
-    """
-    try:
-        mkts = client.load_markets() or {}
-        m = mkts.get(symbol, {})
-        # Explicit precision
-        prec = (m.get("precision", {}) or {}).get("price")
-        if isinstance(prec, int):
-            return prec
-        # Infer from tick size limits if present (use min as proxy)
-        tick = (((m.get("limits", {}) or {}).get("price", {}) or {}).get("min"))
-        if isinstance(tick, (int, float)) and tick > 0:
-            return max(0, min(12, -int(math.floor(math.log10(tick)))))
-        # Some exchanges expose tick size under 'info'
-        info = m.get("info", {}) or {}
-        ts = None
-        for k in ("tickSize", "priceTick", "priceScale"):
-            v = info.get(k)
-            if v is not None:
-                ts = float(v)
-                break
-        if ts and ts > 0:
-            return max(0, min(12, -int(math.floor(math.log10(ts)))))
-    except Exception:
-        pass
-    return None
-
-def _fmt_price(px: Optional[float], decimals: Optional[int] = None) -> str:
-    """
-    Adaptive price formatting:
-      - if exchange decimals known -> respect them (capped at 12)
-      - otherwise choose decimals by magnitude, and use scientific for ultra-tiny
-    """
-    if px is None:
-        return "n/a"
-    try:
-        x = float(px)
-    except Exception:
-        return str(px)
-
-    if decimals is not None:
-        d = max(0, min(12, int(decimals)))
-        s = f"{x:.{d}f}"
-        return s if float(s) != 0.0 else f"{x:.2e}"
-
-    if x == 0.0:
-        return "0"
-    if x >= 1:
-        return f"{x:.4f}"
-    if x >= 0.01:
-        return f"{x:.6f}"
-    if x >= 1e-6:
-        return f"{x:.8f}"
-    return f"{x:.2e}"
-
-def _fmt_pct(v: Optional[float]) -> str:
-    return f"{v:.1f}%" if v is not None else "n/a"
-
-def fmt_mover_signal_block(sig: Dict[str, Any], client: ExClient) -> str:
+def fmt_mover_signal_block(sig: Dict[str, Any]) -> str:
     symbol = sig["symbol"]
     tf = sig["timeframe"]
     note = sig.get("note", "")
-    entry = float(sig["entry"])
-    stop = sig.get("stop")
-    t1 = sig.get("t1")
-    t2 = sig.get("t2")
+    try:
+        entry = float(sig["entry"])
+    except Exception:
+        entry = 0.0
 
-    # Normalize to floats if present
-    stop = float(stop) if stop is not None else None
-    t1   = float(t1)   if t1   is not None else None
-    t2   = float(t2)   if t2   is not None else None
+    # raw levels
+    stop_raw = sig.get("stop")
+    t1_raw = sig.get("t1")
+    t2_raw = sig.get("t2")
 
-    # Back-compat: fix any 0.0 targets that slipped in historically
-    if entry > 0.0:
-        if t1 is not None and t1 == 0.0:
-            t1 = entry * 1.05
-        if t2 is not None and t2 == 0.0:
-            t2 = entry * 1.10
+    stop = float(stop_raw) if stop_raw is not None else None
+    t1 = float(t1_raw) if t1_raw is not None else None
+    t2 = float(t2_raw) if t2_raw is not None else None
 
-    # Percent calculations (guard division by zero)
-    risk_pct = ((entry - stop) / entry * 100.0) if (stop is not None and entry > 0) else None
-    t1_pct   = ((t1 / entry - 1.0) * 100.0)     if (t1 is not None and entry > 0) else None
-    t2_pct   = ((t2 / entry - 1.0) * 100.0)     if (t2 is not None and entry > 0) else None
+    # Percent calculations (safe)
+    risk_pct = None
+    t1_pct = None
+    t2_pct = None
 
-    # Try to respect exchange tick size/precision for this symbol
-    price_decimals = _market_price_decimals(client, symbol)
+    if entry > 0 and stop is not None:
+        try:
+            risk_pct = (entry - stop) / entry * 100.0
+        except ZeroDivisionError:
+            risk_pct = None
+
+    if entry > 0 and t1 is not None and t1 > entry:
+        try:
+            t1_pct = (t1 / entry - 1.0) * 100.0
+        except ZeroDivisionError:
+            t1_pct = None
+
+    if entry > 0 and t2 is not None and t2 > entry:
+        try:
+            t2_pct = (t2 / entry - 1.0) * 100.0
+        except ZeroDivisionError:
+            t2_pct = None
+
+    def pct(x):
+        return f"{x:.1f}%" if x is not None else "n/a"
+
+    direction = "Long"  # Movers are long breakout signals
 
     header = "**Kritocurrency Alpha Signals – Movers Signal 🚀**"
+
     lines = [
         header,
         "",
-        f"> **`{symbol}` — {tf} {note} (Long)**",
-        f"> • Entry: `{_fmt_price(entry, price_decimals)}`",
+        f"> **`{symbol}` — {tf} {note} ({direction})**",
+        f"> • Entry: `{entry:.6f}`",
     ]
 
     if stop is not None:
-        lines.append(f"> • Stop-loss: `{_fmt_price(stop, price_decimals)}`  (~{_fmt_pct(risk_pct)} risk)")
+        lines.append(f"> • Stop-loss: `{stop:.6f}`  (~{pct(risk_pct)} risk)")
 
     if t1 is not None:
-        lines.append(f"> • Target 1: `{_fmt_price(t1, price_decimals)}`  (~{_fmt_pct(t1_pct)} from entry)")
+        lines.append(f"> • Target 1: `{t1:.6f}`  (~{pct(t1_pct)} from entry)")
 
     if t2 is not None:
-        lines.append(f"> • Target 2: `{_fmt_price(t2, price_decimals)}`  (~{_fmt_pct(t2_pct)} from entry)")
+        lines.append(f"> • Target 2: `{t2:.6f}`  (~{pct(t2_pct)} from entry)")
 
     lines.append("")
     lines.append("_Use position sizing and your own risk management. Not financial advice._")
 
     return "\n".join(lines)
-
-# =============== Optional one-time healer ===============
-def heal_legacy_zero_targets(rds: RedisState):
-    """
-    Repairs existing movers trades in Redis where t1/t2 were stored as 0.0 due to previous rounding.
-    Safe to call every run; writes only if needed.
-    """
-    book = rds.load_json("state", "silent_open", default={})
-    if not book:
-        return
-    changed = False
-    for k, tr in list(book.items()):
-        if tr.get("source") != "movers":
-            continue
-        try:
-            entry = float(tr.get("entry") or 0.0)
-            if entry <= 0:
-                continue
-            t1 = tr.get("t1"); t2 = tr.get("t2")
-            if (t1 is not None and float(t1) == 0.0):
-                tr["t1"] = entry * 1.05; changed = True
-            if (t2 is not None and float(t2) == 0.0):
-                tr["t2"] = entry * 1.10; changed = True
-            book[k] = tr
-        except Exception:
-            pass
-    if changed:
-        rds.save_json(book, "state", "silent_open")
-        print("[heal] fixed legacy zero t1/t2 in movers records")
 
 # =============== RUN ===============
 def run(cfg: Dict[str, Any]):
@@ -743,9 +699,6 @@ def run(cfg: Dict[str, Any]):
         prefix=cfg.get("persistence", {}).get("key_prefix", "spideybot:v1"),
         ttl_minutes=int(cfg.get("persistence", {}).get("ttl_minutes", 2880)),
     )
-
-    # One-time repair for any legacy zero targets
-    heal_legacy_zero_targets(rds)
 
     # Discord hook
     SIG_HOOK = os.environ.get("DISCORD_SIGNALS_WEBHOOK") or cfg.get("discord", {}).get("signals_webhook", "")
@@ -795,7 +748,7 @@ def run(cfg: Dict[str, Any]):
     close_silent_if_hit(rds, client, cfg)
     movers_stats_table(rds)
     movers_time_stats_table(rds)
-    # movers_detailed_table(rds, max_rows=movers_max_rows)  # optional verbose log
+    movers_detailed_table(rds, movers_max_rows)
 
     # ======== Logs ========
     print(f"=== Movers scan done @ {pd.Timestamp.utcnow().isoformat()} ===")
@@ -803,7 +756,7 @@ def run(cfg: Dict[str, Any]):
 
     # ======== Discord (Movers only) ========
     for sig in results_movers:
-        msg = fmt_mover_signal_block(sig, client)
+        msg = fmt_mover_signal_block(sig)
         _post_discord(SIG_HOOK, msg)
 
 # =============== Entrypoint ===============
