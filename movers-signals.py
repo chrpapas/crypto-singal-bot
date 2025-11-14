@@ -684,7 +684,7 @@ def fmt_mover_signal_block(sig: Dict[str, Any], client: ExClient) -> str:
     # Try to respect exchange tick size/precision for this symbol
     price_decimals = _market_price_decimals(client, symbol)
 
-    header = "**Kriticurrency Alpha Signals – Movers Signal 🚀**"
+    header = "**Kritocurrency Alpha Signals – Movers Signal 🚀**"
     lines = [
         header,
         "",
