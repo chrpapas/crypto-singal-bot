@@ -16,6 +16,7 @@ discord:
   # and set it in the environment.
   signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}
   performance_webhook: ${DISCORD_PERFORMANCE_WEBHOOK}  # for perf scripts
+  delayed_webhook: ${DISCORD_DELAYED_WEBHOOK}
 
 filters:
   # Extra stables to exclude if they appear as base assets.
