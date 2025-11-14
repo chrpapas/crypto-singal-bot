@@ -2,237 +2,256 @@
 # -*- coding: utf-8 -*-
 
 """
-movers_delayed_bot.py — Delayed preview publisher for Movers signals.
+movers_delayed_signals_bot.py — Delayed-preview bot for Movers signals
 
-- Reads movers signals from Redis (same as mexc_movers_bot.py)
-- After a configurable delay, posts a sanitized "preview" to a
-  separate Discord channel (no entry/SL/TP/percentages).
-- Marks each signal as 'delayed_preview_sent' to avoid duplicates.
+- Reads Movers signals from the same Redis used by mexc_movers_bot.py
+- Publishes delayed previews to a separate Discord channel
+- Uses config file (same style as movers-signals-config.yml)
 
-ENV / CONFIG:
-  REDIS_URL                       (or persistence.redis_url in config)
-  DISCORD_DELAYED_WEBHOOK         (or discord.delayed_webhook in config)
-  ALPHA_UPGRADE_URL               (optional; falls back to placeholder)
-  DELAY_MINUTES                   (optional; default: 30)
+ENV (optional):
+  REDIS_URL
+  DISCORD_DELAYED_WEBHOOK
+
+Config (YAML):
+  persistence:
+    redis_url: ...
+    key_prefix: spideybot:v1
+    ttl_minutes: 2880
+
+  discord:
+    signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}  # fallback if delayed not provided
+
+  delayed_signals:
+    webhook: ${DISCORD_DELAYED_WEBHOOK}
+    min_delay_minutes: 240         # how long after signal before preview allowed
+    max_age_days: 14               # ignore signals older than this
+    max_previews_per_run: 5        # cap per run to avoid spam
 """
 
 import argparse
 import json
 import os
 import sys
-import yaml
-import requests
+from datetime import timedelta
+
 import pandas as pd
 import redis
-from typing import Dict, Any, Optional
+import requests
+import yaml
 
-# =============== Config helpers ===============
+# ---------------- Config helpers ----------------
 
-def load_config(path: str) -> Dict[str, Any]:
+
+def expand_env(o):
+    if isinstance(o, dict):
+        return {k: expand_env(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [expand_env(x) for x in o]
+    if isinstance(o, str) and o.startswith("${") and o.endswith("}"):
+        return os.environ.get(o[2:-1], o)
+    return o
+
+
+def load_config(path: str) -> dict:
     print(f"[delayed] Loading config from {path}")
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
-
-    def expand_env(o):
-        if isinstance(o, dict):
-            return {k: expand_env(v) for k, v in o.items()}
-        if isinstance(o, list):
-            return [expand_env(x) for x in o]
-        if isinstance(o, str) and o.startswith("${") and o.endswith("}"):
-            return os.environ.get(o[2:-1], o)
-        return o
-
     cfg = expand_env(cfg)
     return cfg
 
-# =============== Redis wrapper ===============
 
-class RedisState:
-    def __init__(self, url: str, prefix: str, ttl_minutes: int):
-        if not url:
-            raise RuntimeError("Redis URL missing. Provide REDIS_URL or persistence.redis_url in config.")
-        self.prefix = prefix or "spideybot:v1"
-        self.ttl_seconds = int(ttl_minutes) * 60 if ttl_minutes else 48 * 3600
-        self.r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=6)
-        # self-test
-        self.r.setex(self.k("delayed_selftest"), self.ttl_seconds, pd.Timestamp.utcnow().isoformat())
-        print(f"[delayed] Redis OK | prefix={self.prefix} | ttl-min={self.ttl_seconds//60}")
+# ---------------- Redis helpers ----------------
 
-    def k(self, *parts) -> str:
-        return ":".join([self.prefix, *[str(p) for p in parts]])
+def init_redis_from_config(cfg: dict) -> tuple[redis.Redis, str]:
+    p = cfg.get("persistence", {}) or {}
+    redis_url = p.get("redis_url") or os.environ.get("REDIS_URL")
+    if not redis_url:
+        print("[delayed] ERROR: redis_url not set in config and REDIS_URL env missing.", file=sys.stderr)
+        sys.exit(1)
 
-    def get(self, *parts) -> Optional[str]:
-        return self.r.get(self.k(*parts))
+    key_prefix = p.get("key_prefix", "spideybot:v1")
+    ttl_minutes = int(p.get("ttl_minutes", 2880))
 
-    def load_json(self, *parts, default=None):
-        txt = self.get(*parts)
-        if not txt:
-            return default if default is not None else {}
-        try:
-            return json.loads(txt)
-        except Exception:
-            return default if default is not None else {}
+    r = redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=6)
+    # self-test + keep TTL behavior similar to main bot
+    r.setex(f"{key_prefix}:selftest_delayed", ttl_minutes * 60, pd.Timestamp.utcnow().isoformat())
 
-    def save_json(self, obj, *parts):
-        self.r.set(self.k(*parts), json.dumps(obj))
+    print(f"[delayed] Redis OK | prefix={key_prefix}")
+    return r, key_prefix
 
-# =============== Discord helper ===============
 
-def get_delayed_webhook(cfg: Dict[str, Any]) -> str:
-    hook = os.environ.get("DISCORD_DELAYED_WEBHOOK") or cfg.get("discord", {}).get("delayed_webhook", "")
-    if not hook or "${DISCORD_DELAYED_WEBHOOK}" in str(hook):
-        print("[delayed] ERROR: No valid DISCORD_DELAYED_WEBHOOK / discord.delayed_webhook configured.", file=sys.stderr)
+def redis_key(prefix: str, *parts) -> str:
+    return ":".join([prefix, *[str(p) for p in parts]])
+
+
+def redis_load_json(r: redis.Redis, prefix: str, *parts, default=None):
+    key = redis_key(prefix, *parts)
+    txt = r.get(key)
+    if not txt:
+        return default if default is not None else {}
+    try:
+        return json.loads(txt)
+    except Exception:
+        return default if default is not None else {}
+
+
+def redis_save_json(r: redis.Redis, prefix: str, obj, *parts):
+    key = redis_key(prefix, *parts)
+    r.set(key, json.dumps(obj))
+
+
+# ---------------- Discord helper ----------------
+
+def pick_delayed_webhook(cfg: dict) -> str:
+    dcfg = cfg.get("delayed_signals", {}) or {}
+    discord_cfg = cfg.get("discord", {}) or {}
+
+    # Priority:
+    # 1) delayed_signals.webhook in config (after env expansion)
+    # 2) DISCORD_DELAYED_WEBHOOK env
+    # 3) discord.signals_webhook (main signals) as last fallback
+    hook = dcfg.get("webhook") or os.environ.get("DISCORD_DELAYED_WEBHOOK") or discord_cfg.get("signals_webhook", "")
+
+    if not hook or hook.startswith("${"):
+        print("[delayed] WARNING: No valid delayed Discord webhook configured.")
         return ""
-    print("[delayed] Using delayed Discord webhook from env/config.")
-    return str(hook)
+    print("[delayed] Using Discord delayed webhook from env/config.")
+    return hook
+
 
 def post_discord(hook: str, text: str):
     if not hook:
-        print("[delayed] No webhook configured; skipping Discord post.", file=sys.stderr)
+        print("[delayed] No webhook provided; skipping Discord post.")
         return
     if not text.strip():
+        print("[delayed] Empty message; skipping Discord post.")
         return
     try:
-        r = requests.post(hook, json={"content": text}, timeout=10)
-        if r.status_code >= 300:
-            print(f"[delayed] Discord post failed: HTTP {r.status_code} {r.text}", file=sys.stderr)
+        resp = requests.post(hook, json={"content": text}, timeout=10)
+        if resp.status_code >= 300:
+            print(f"[delayed] Discord post failed: HTTP {resp.status_code} {resp.text}")
         else:
             print("[delayed] Discord post OK.")
     except Exception as e:
-        print(f"[delayed] Discord post error: {e}", file=sys.stderr)
+        print(f"[delayed] Discord post error: {e}")
 
-# =============== Message formatting ===============
 
-def fmt_delayed_preview(tr: Dict[str, Any], delay_minutes: int, upgrade_url: str) -> str:
-    symbol = tr.get("symbol", "UNKNOWN")
+# ---------------- Core logic ----------------
+
+def fmt_delayed_message(tr: dict, delay_minutes: float) -> str:
+    """
+    Build the delayed preview Discord message for a single mover trade.
+    """
+    symbol = tr.get("symbol", "?")
     tf = tr.get("tf") or tr.get("timeframe") or "1h"
-    typ = (tr.get("type") or "").lower()
-    note = tr.get("note") or "Mover Signal"
-    opened_at = tr.get("opened_at")
-    opened_ts = pd.to_datetime(opened_at, utc=True) if opened_at else None
-    now = pd.Timestamp.utcnow().tz_localize("UTC") if not pd.Timestamp.utcnow().tzinfo else pd.Timestamp.utcnow()
-    age_min = None
-    if opened_ts is not None:
-        age_min = (now - opened_ts).total_seconds() / 60.0
+    note = tr.get("note") or "Mover Trend"
+    opened_at = tr.get("opened_at") or tr.get("bar_id") or "unknown"
 
-    # Human text for delay (rounded actual age)
-    delay_txt = f"{int(round(age_min))} minutes" if age_min is not None else f"{delay_minutes} minutes"
+    delay_min_int = int(delay_minutes)
+    delay_hours = delay_minutes / 60.0
 
-    # Generic readable type
-    if typ == "day":
-        typ_label = "1h Breakout"
-    else:
-        typ_label = "Mover Breakout"
-
-    header = "**Kriticurrency Alpha Signals – Movers Signal (Delayed Preview) 🚀**"
-
-    lines = [
-        header,
-        "",
-        f"**Symbol:** `{symbol}`",
-        f"**Timeframe:** {tf}",
-        f"**Pattern:** {typ_label}",
-        f"**Engine:** AI-powered Movers breakout scanner",
-        "",
-        f"⏱️ *This preview is delayed by about* **{delay_txt}**.",
-        f"Realtime entries, stop-loss, targets & risk ratings are available only to **Alpha Members**.",
-        "",
-        f"🔓 Upgrade to realtime access → {upgrade_url}",
-    ]
-
-    msg = "\n".join(lines)
-    # Just in case, hard-limit to 2000 chars for Discord
-    if len(msg) > 2000:
-        msg = msg[:1990] + "…"
+    msg = (
+        "**Kriticurrency Alpha Signals – Movers Signal (Delayed Preview) 🚀**\n\n"
+        f"**Symbol:** `{symbol}`\n"
+        f"**Timeframe:** {tf}\n"
+        f"**Pattern:** {note}\n"
+        f"**Engine:** AI-powered Movers breakout scanner\n\n"
+        f"⏱️ *Original signal time:* `{opened_at}` (UTC)\n"
+        f"⏱️ *This preview is delayed by about* **{delay_min_int} minutes** "
+        f"(~{delay_hours:.1f} hours).\n\n"
+        "Realtime entries, stop-loss, targets & risk ratings are available only to **Alpha Members**."
+    )
     return msg
 
-# =============== Core logic ===============
 
-def run(cfg: Dict[str, Any]):
-    print("[delayed] Starting delayed movers preview bot…")
+def run(cfg: dict):
+    print("[delayed] Starting delayed Movers preview run...")
 
-    # Delay config
-    delay_minutes = int(os.environ.get("DELAY_MINUTES", "30"))
-    print(f"[delayed] Using delay threshold: {delay_minutes} minutes")
+    # Redis + webhook
+    r, prefix = init_redis_from_config(cfg)
+    hook = pick_delayed_webhook(cfg)
 
-    upgrade_url = os.environ.get("ALPHA_UPGRADE_URL", "https://your-landing-page-here")
-    print(f"[delayed] Using upgrade URL: {upgrade_url}")
+    delayed_cfg = cfg.get("delayed_signals", {}) or {}
+    min_delay_minutes = int(delayed_cfg.get("min_delay_minutes", 240))
+    max_age_days = int(delayed_cfg.get("max_age_days", 14))
+    max_previews_per_run = int(delayed_cfg.get("max_previews_per_run", 5))
 
-    # Redis init
-    redis_url = cfg.get("persistence", {}).get("redis_url") or os.environ.get("REDIS_URL")
-    prefix = cfg.get("persistence", {}).get("key_prefix", "spideybot:v1")
-    ttl = int(cfg.get("persistence", {}).get("ttl_minutes", 2880))
-    rds = RedisState(redis_url, prefix, ttl)
+    print(
+        f"[delayed] Settings: min_delay={min_delay_minutes}min, "
+        f"max_age={max_age_days}d, cap_per_run={max_previews_per_run}"
+    )
 
-    # Discord webhook
-    hook = get_delayed_webhook(cfg)
-    if not hook:
-        print("[delayed] Exiting because no delayed webhook is configured.", file=sys.stderr)
-        return
+    # Load signal book and sent registry
+    book = redis_load_json(r, prefix, "state", "silent_open", default={})
+    print(f"[delayed] Loaded {len(book)} total signals from Redis.")
 
-    # Load trade book
-    book = rds.load_json("state", "silent_open", default={})
-    if not book:
-        print("[delayed] No trades found in Redis. Nothing to preview.")
-        return
+    sent_reg = redis_load_json(r, prefix, "state", "delayed_previews_sent", default={})
+    print(f"[delayed] Loaded {len(sent_reg)} already-previewed entries.")
 
-    now = pd.Timestamp.utcnow().tz_localize("UTC") if not pd.Timestamp.utcnow().tzinfo else pd.Timestamp.utcnow()
-    delay_seconds = delay_minutes * 60
+    now = pd.Timestamp.utcnow()
+    min_delay = timedelta(minutes=min_delay_minutes)
+    max_age = timedelta(days=max_age_days)
 
-    # Iterate over movers trades and find those eligible for delayed preview
-    to_mark = []
-    num_candidates = 0
-    num_posted = 0
-
+    # Collect eligible movers signals
+    candidates = []
     for k, tr in book.items():
-        # Only movers source trades (created by movers bot)
+        # Only Movers signals
         if tr.get("source") != "movers":
             continue
 
-        # Only signals that are still open (ignore already closed trades for preview)
-        if tr.get("status") != "open":
+        # Already previewed before? Skip.
+        if k in sent_reg:
             continue
 
-        # Skip if preview already sent
-        if tr.get("delayed_preview_sent"):
-            continue
-
-        opened_at = tr.get("opened_at")
-        if not opened_at:
+        opened_raw = tr.get("opened_at") or tr.get("bar_id")
+        if not opened_raw:
             continue
 
         try:
-            opened_ts = pd.to_datetime(opened_at, utc=True)
+            opened_at = pd.to_datetime(opened_raw, utc=True)
         except Exception:
             continue
 
-        age_sec = (now - opened_ts).total_seconds()
-        if age_sec < delay_seconds:
-            # Not yet past delay threshold
+        age = now - opened_at
+
+        # Too fresh -> not yet eligible
+        if age < min_delay:
             continue
 
-        num_candidates += 1
+        # Too old -> ignore (but do NOT mark as sent; keeps behavior simple if you change config later)
+        if age > max_age:
+            continue
 
-        # Build and send preview
-        msg = fmt_delayed_preview(tr, delay_minutes, upgrade_url)
-        print(f"[delayed] Posting delayed preview for {tr.get('symbol')} (opened_at={opened_at})")
+        candidates.append((k, tr, opened_at, age))
+
+    print(f"[delayed] Found {len(candidates)} eligible delayed movers signals.")
+
+    if not candidates:
+        print("[delayed] Nothing to send this run.")
+        return
+
+    # Oldest first, so backlog drains in chronological order
+    candidates.sort(key=lambda x: x[2])
+
+    posted = 0
+    for k, tr, opened_at, age in candidates:
+        if posted >= max_previews_per_run:
+            break
+
+        delay_minutes = age.total_seconds() / 60.0
+        msg = fmt_delayed_message(tr, delay_minutes)
         post_discord(hook, msg)
 
-        # Mark to update
-        tr["delayed_preview_sent"] = True
-        tr["delayed_preview_sent_at"] = now.isoformat()
-        book[k] = tr
-        num_posted += 1
+        # Mark as previewed
+        sent_reg[k] = now.isoformat()
+        posted += 1
 
-    if num_posted > 0:
-        rds.save_json(book, "state", "silent_open")
-        print(f"[delayed] Marked {num_posted} trades as delayed_preview_sent.")
-    else:
-        print("[delayed] No new signals eligible for delayed preview right now.")
+    # Save updated registry
+    redis_save_json(r, prefix, sent_reg, "state", "delayed_previews_sent")
+    print(f"[delayed] Posted {posted} delayed previews this run.")
 
-    print(f"[delayed] Done. Candidates checked: {num_candidates}, posted: {num_posted}")
 
-# =============== Entrypoint ===============
+# ---------------- Entrypoint ----------------
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
