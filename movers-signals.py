@@ -256,15 +256,19 @@ def is_silent_open_movers(rds: RedisState, symbol: str, tf: str, typ: str) -> bo
 def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
     """
     Evaluate all open silent signals and close them if stop/T1/T2 is hit.
+
     Also logs:
-      - time_to_outcome_min
-      - time_to_t1_min
-      - time_to_t2_min
-    in minutes, based on OHLCV timestamps.
+      - time_to_outcome_min  (first time any of stop/T1/T2 is reached)
+      - time_to_t1_min       (first time T1 is reached, even if outcome is T2 or stop)
+      - time_to_t2_min       (first time T2 is reached, if ever)
+
+    This version explicitly tracks first touches of T1/T2 before deciding outcome,
+    so timestamps are always recorded when levels are hit.
     """
     book = rds.load_json("state", "silent_open", default={})
     if not book:
         return
+
     changed = False
 
     for k, tr in list(book.items()):
@@ -281,69 +285,82 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
         try:
             limit = 400 if tf in ("1h", "4h") else 330
             df = client.ohlcv(pair, tf, limit)
+
             opened_at = pd.to_datetime(tr["opened_at"], utc=True)
+            # start from the signal bar and forward
             df = df.loc[opened_at:]
-            rows = df.iloc[1:]  # bars after signal bar
+            # skip the signal bar itself; we only care about bars AFTER the entry bar
+            rows = df.iloc[1:]
 
-            outcome = None
-            price = None
-            hit_ts = None
+            outcome = None       # "t1", "t2", "stop"
+            exit_price = None
+            hit_ts = None        # time of final outcome
 
-            # first time T1 is ever touched (even if we later hit T2)
-            t1_ts = None
+            t1_ts = None         # first time T1 is ever touched
+            t2_ts = None         # first time T2 is ever touched
 
             for ts, r in rows.iterrows():
                 lo, hi = float(r["low"]), float(r["high"])
 
-                # track first touch of T1
+                # Track first touches of T1/T2 (even if we later stop out)
                 if t1 is not None and hi >= t1 and t1_ts is None:
                     t1_ts = ts
+                if t2 is not None and hi >= t2 and t2_ts is None:
+                    t2_ts = ts
 
-                # both stop and targets in same candle -> optimistic ordering
-                if stop is not None and lo <= stop and t2 is not None and hi >= t2:
-                    outcome, price, hit_ts = "t2", t2, ts
-                    break
-                if stop is not None and lo <= stop and t1 is not None and hi >= t1:
-                    outcome, price, hit_ts = "t1", t1, ts
-                    break
+                touched_stop = (stop is not None and lo <= stop)
+                touched_t1   = (t1 is not None and hi >= t1)
+                touched_t2   = (t2 is not None and hi >= t2)
 
-                # simple cases
-                if stop is not None and lo <= stop:
-                    outcome, price, hit_ts = "stop", stop, ts
-                    break
-                if t2 is not None and hi >= t2:
-                    outcome, price, hit_ts = "t2", t2, ts
-                    break
-                if t1 is not None and hi >= t1:
-                    outcome, price, hit_ts = "t1", t1, ts
-                    break
+                # If nothing was hit this bar, continue
+                if not (touched_stop or touched_t1 or touched_t2):
+                    continue
+
+                # Optimistic ordering inside a single candle:
+                # Prefer T2 > T1 > Stop if they occur in the same bar.
+                if touched_t2:
+                    outcome = "t2"
+                    exit_price = t2
+                    hit_ts = ts
+                elif touched_t1:
+                    outcome = "t1"
+                    exit_price = t1
+                    hit_ts = ts
+                else:
+                    outcome = "stop"
+                    exit_price = stop
+                    hit_ts = ts
+
+                break  # we stop at the first bar where any level is triggered
 
             if outcome:
                 tr["status"] = "closed"
                 tr["closed_at"] = hit_ts.isoformat() if hit_ts is not None else df.index[-1].isoformat()
-                tr["outcome"] = outcome  # "t1", "t2" or "stop"
-                tr["exit_price"] = float(price)
+                tr["outcome"] = outcome
+                tr["exit_price"] = float(exit_price)
 
-                # timing metrics
+                # --- timing metrics ---
+                opened_ts = opened_at
+
                 if hit_ts is not None:
-                    dt_outcome = (hit_ts - opened_at).total_seconds() / 60.0
+                    dt_outcome = (hit_ts - opened_ts).total_seconds() / 60.0
                     tr["time_to_outcome_min"] = float(dt_outcome)
                 else:
                     tr["time_to_outcome_min"] = None
 
                 if t1_ts is not None:
-                    dt_t1 = (t1_ts - opened_at).total_seconds() / 60.0
+                    dt_t1 = (t1_ts - opened_ts).total_seconds() / 60.0
                     tr["time_to_t1_min"] = float(dt_t1)
                 else:
                     tr["time_to_t1_min"] = None
 
-                if outcome == "t2" and hit_ts is not None:
-                    dt_t2 = (hit_ts - opened_at).total_seconds() / 60.0
+                if t2_ts is not None:
+                    dt_t2 = (t2_ts - opened_ts).total_seconds() / 60.0
                     tr["time_to_t2_min"] = float(dt_t2)
                 else:
                     tr["time_to_t2_min"] = None
 
-                # optional: compute R multiple
+                # --- R multiple (unchanged logic) ---
                 try:
                     entry = float(tr.get("entry"))
                     stop_val = tr.get("stop")
@@ -364,7 +381,7 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
 
     if changed:
         rds.save_json(book, "state", "silent_open")
-
+      
 def movers_stats_table(rds: RedisState):
     book = rds.load_json("state", "silent_open", default={})
     movers = [
