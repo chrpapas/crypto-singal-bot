@@ -151,7 +151,7 @@ def fmt_delayed_message(tr: dict, delay_minutes: float) -> str:
     delay_hours = delay_minutes / 60.0
 
     msg = (
-        "**Kriticurrency Alpha Signals – Movers Signal (Delayed Preview) 🚀**\n\n"
+        "**Kritocurrency Alpha Signals – Movers Signal (Delayed Preview) 🚀**\n\n"
         f"**Symbol:** `{symbol}`\n"
         f"**Timeframe:** {tf}\n"
         f"**Pattern:** {note}\n"
