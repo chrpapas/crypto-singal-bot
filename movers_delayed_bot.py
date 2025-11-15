@@ -6,26 +6,34 @@ movers_delayed_signals_bot.py — Delayed-preview bot for Movers signals
 
 - Reads Movers signals from the same Redis used by mexc_movers_bot.py
 - Publishes delayed previews to a separate Discord channel
+- Optionally posts short delayed previews to Twitter/X
 - Uses config file (same style as movers-signals-config.yml)
 
-ENV (optional):
+ENV (optional, only for Discord if you still want):
   REDIS_URL
   DISCORD_DELAYED_WEBHOOK
 
-Config (YAML):
+Config (YAML example):
+
   persistence:
-    redis_url: ...
+    redis_url: "rediss://..."
     key_prefix: spideybot:v1
     ttl_minutes: 2880
 
   discord:
-    signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}  # fallback if delayed not provided
+    # Main realtime signals webhook (not used here, but kept for compatibility)
+    signals_webhook: "${DISCORD_SIGNALS_WEBHOOK}"
 
   delayed_signals:
-    webhook: ${DISCORD_DELAYED_WEBHOOK}
+    webhook: "https://discord.com/api/webhooks/...."  # delayed channel webhook
     min_delay_minutes: 240         # how long after signal before preview allowed
     max_age_days: 14               # ignore signals older than this
     max_previews_per_run: 5        # cap per run to avoid spam
+
+  twitter:
+    enabled: true
+    bearer_token: "YOUR_USER_CONTEXT_BEARER_TOKEN_HERE"
+    promo_url: "https://discord.gg/U2g7qHZP"   # optional: link to your Discord/landing
 """
 
 import argparse
@@ -48,6 +56,8 @@ def expand_env(o):
     if isinstance(o, list):
         return [expand_env(x) for x in o]
     if isinstance(o, str) and o.startswith("${") and o.endswith("}"):
+        # Allow env expansion for backwards compat, but config
+        # can also contain plain values with no env usage.
         return os.environ.get(o[2:-1], o)
     return o
 
@@ -62,7 +72,10 @@ def load_config(path: str) -> dict:
 
 # ---------------- Redis helpers ----------------
 
-def init_redis_from_config(cfg: dict) -> tuple[redis.Redis, str]:
+def init_redis_from_config(cfg: dict):
+    """
+    Returns (redis_client, key_prefix)
+    """
     p = cfg.get("persistence", {}) or {}
     redis_url = p.get("redis_url") or os.environ.get("REDIS_URL")
     if not redis_url:
@@ -112,7 +125,7 @@ def pick_delayed_webhook(cfg: dict) -> str:
     # 3) discord.signals_webhook (main signals) as last fallback
     hook = dcfg.get("webhook") or os.environ.get("DISCORD_DELAYED_WEBHOOK") or discord_cfg.get("signals_webhook", "")
 
-    if not hook or hook.startswith("${"):
+    if not hook or str(hook).startswith("${"):
         print("[delayed] WARNING: No valid delayed Discord webhook configured.")
         return ""
     print("[delayed] Using Discord delayed webhook from env/config.")
@@ -136,11 +149,69 @@ def post_discord(hook: str, text: str):
         print(f"[delayed] Discord post error: {e}")
 
 
-# ---------------- Core logic ----------------
+# ---------------- Twitter helpers ----------------
 
-def fmt_delayed_message(tr: dict, delay_minutes: float) -> str:
+def init_twitter_from_config(cfg: dict):
+    """
+    Returns (bearer_token, promo_url) or (None, None) if disabled/misconfigured.
+
+    bearer_token should be a *user-context* OAuth2 token that can post tweets.
+    """
+    tw = cfg.get("twitter", {}) or {}
+    enabled = bool(tw.get("enabled", False))
+    if not enabled:
+        print("[delayed] Twitter disabled in config.")
+        return None, None
+
+    bearer = tw.get("bearer_token")
+    if not bearer or str(bearer).startswith("${"):
+        print("[delayed] Twitter enabled but bearer_token missing or placeholder; skipping Twitter.")
+        return None, None
+
+    promo_url = tw.get("promo_url") or ""
+    print("[delayed] Twitter posting enabled via config.")
+    return bearer, promo_url
+
+
+def post_twitter(bearer_token: str, text: str):
+    if not bearer_token:
+        return
+    if not text.strip():
+        print("[delayed] Empty tweet text; skipping Twitter post.")
+        return
+
+    # Hard trim to 280 characters
+    text = text.strip()
+    if len(text) > 280:
+        text = text[:277] + "…"
+
+    headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"text": text}
+
+    try:
+        resp = requests.post(
+            "https://api.twitter.com/2/tweets",
+            headers=headers,
+            json=payload,
+            timeout=10,
+        )
+        if resp.status_code not in (200, 201):
+            print(f"[delayed] Twitter post failed: HTTP {resp.status_code} {resp.text}")
+        else:
+            print("[delayed] Twitter post OK.")
+    except Exception as e:
+        print(f"[delayed] Twitter post error: {e}")
+
+
+# ---------------- Formatting helpers ----------------
+
+def fmt_delayed_discord_message(tr: dict, delay_minutes: float) -> str:
     """
     Build the delayed preview Discord message for a single mover trade.
+    No upsell line – you keep upsell in channel pinned message.
     """
     symbol = tr.get("symbol", "?")
     tf = tr.get("tf") or tr.get("timeframe") or "1h"
@@ -164,12 +235,44 @@ def fmt_delayed_message(tr: dict, delay_minutes: float) -> str:
     return msg
 
 
+def fmt_delayed_tweet(tr: dict, delay_minutes: float, promo_url: str = "") -> str:
+    """
+    Short tweet-format version of the delayed preview.
+    Kept concise; trimmed to 280 chars in post_twitter().
+    """
+    symbol = tr.get("symbol", "?")
+    tf = tr.get("tf") or tr.get("timeframe") or "1h"
+    note = tr.get("note") or "Mover Trend"
+    opened_at = tr.get("opened_at") or tr.get("bar_id") or "unknown"
+
+    delay_hours = delay_minutes / 60.0
+
+    base = (
+        f"Delayed Movers signal (preview) 🚀\n"
+        f"{symbol} · {tf} · {note}\n"
+        f"Original (UTC): {opened_at}\n"
+        f"Delay: ~{delay_hours:.1f}h\n"
+        f"Realtime entries & risk levels only for Alpha Members on Discord."
+    )
+
+    if promo_url:
+        base += f"\nJoin: {promo_url}"
+
+    # Add a couple of hashtags for reach
+    base += "\n#crypto #trading #altcoins"
+
+    return base
+
+
+# ---------------- Core logic ----------------
+
 def run(cfg: dict):
     print("[delayed] Starting delayed Movers preview run...")
 
-    # Redis + webhook
+    # Redis + Discord + Twitter
     r, prefix = init_redis_from_config(cfg)
     hook = pick_delayed_webhook(cfg)
+    bearer_token, promo_url = init_twitter_from_config(cfg)
 
     delayed_cfg = cfg.get("delayed_signals", {}) or {}
     min_delay_minutes = int(delayed_cfg.get("min_delay_minutes", 240))
@@ -239,8 +342,15 @@ def run(cfg: dict):
             break
 
         delay_minutes = age.total_seconds() / 60.0
-        msg = fmt_delayed_message(tr, delay_minutes)
-        post_discord(hook, msg)
+
+        # Discord message
+        d_msg = fmt_delayed_discord_message(tr, delay_minutes)
+        post_discord(hook, d_msg)
+
+        # Twitter message (if configured)
+        if bearer_token:
+            t_msg = fmt_delayed_tweet(tr, delay_minutes, promo_url)
+            post_twitter(bearer_token, t_msg)
 
         # Mark as previewed
         sent_reg[k] = now.isoformat()
