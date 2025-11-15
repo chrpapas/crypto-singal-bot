@@ -20,10 +20,8 @@ discord:
 
 twitter:
   enabled: true
-  api_key: Zo8WvELqLE35im9knxmDtDAi2
-  api_secret: yvOSIyQkyicfpzppEjHzlEGev64y6abTJBBCjYRanGIuAsUUZC
-  access_token: a1hhbzBfNE9lWG1JMGN1bXZhUkU6MTpjaQ
-  access_token_secret: W8aiBLHqO_HayYcl1T9ZwSWui4Jij3LC6EUuK_a1WXtGYNdRgI
+  client_id: a1hhbzBfNE9lWG1JMGN1bXZhUkU6MTpjaQ
+  client_secret: W8aiBLHqO_HayYcl1T9ZwSWui4Jij3LC6EUuK_a1WXtGYNdRgI
   
 delayed_signals:
   webhook: ${DISCORD_DELAYED_WEBHOOK}  # your delayed channel webhook
