@@ -19,7 +19,7 @@ discord:
   delayed_webhook: ${DISCORD_DELAYED_WEBHOOK}
 
 twitter:
-  enabled: true
+  enabled: false
   client_id: a1hhbzBfNE9lWG1JMGN1bXZhUkU6MTpjaQ
   client_secret: W8aiBLHqO_HayYcl1T9ZwSWui4Jij3LC6EUuK_a1WXtGYNdRgI
   
