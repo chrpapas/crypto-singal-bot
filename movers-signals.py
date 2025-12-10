@@ -4,7 +4,7 @@
 """
 mexc_movers_bot.py — Movers-only scanner with:
 - CMC Movers universe -> mapped to MEXC spot
-- Legacy Movers signal logic (5% / 10% targets)
+- Legacy Movers signal logic (5% / 10% targets) (+ config-based filters)
 - Redis-based silent registry + performance stats
 - Discord: Movers signals only (no MEXC mention in message)
 
@@ -104,6 +104,7 @@ class RedisState:
         self.prefix = prefix or "spideybot:v1"
         self.ttl_seconds = int(ttl_minutes) * 60 if ttl_minutes else 48 * 3600
         self.r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=6)
+        # NOTE: only this selftest key uses TTL. Signals/history do NOT expire.
         self.r.setex(self.k("selftest"), self.ttl_seconds, pd.Timestamp.utcnow().isoformat())
         print(f"[persistence] Redis OK | prefix={self.prefix} | edge-ttl-min={self.ttl_seconds//60}")
 
@@ -129,6 +130,7 @@ class RedisState:
             return default if default is not None else {}
 
     def save_json(self, obj, *parts):
+        # IMPORTANT: no TTL here -> history persists
         self.set(json.dumps(obj), *parts)
 
 # =============== Stablecoin filtering (base-only) ===============
@@ -186,10 +188,24 @@ def filter_pairs_on_mexc(client: ExClient, symbols: List[str], quote: str = "USD
             out.append(pair)
     return out
 
-# =============== Legacy Movers Signal (5% / 10% targets) ===============
-def legacy_mover_signal(df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+# =============== Legacy Movers Signal (5% / 10% targets) with config filters ===============
+def legacy_mover_signal(df1h: pd.DataFrame, mv_cfg: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Core breakout logic for Movers.
+
+    Enhanced with:
+      - config-based risk filter (min/max stop distance in %)
+      - config-based volume confirmation factor
+    """
     if df1h is None or len(df1h) < 80:
         return None
+
+    mv_cfg = mv_cfg or {}
+    risk_cfg = mv_cfg.get("risk_filter", {}) or {}
+    min_risk_pct = float(risk_cfg.get("min_risk_pct", 1.0))
+    max_risk_pct = float(risk_cfg.get("max_risk_pct", 10.0))
+
+    min_rel_volume = float(mv_cfg.get("min_rel_volume", 1.0))
 
     e20, e50 = ema(df1h["close"], 20), ema(df1h["close"], 50)
     mac_line, mac_sig, _ = macd(df1h["close"])
@@ -205,9 +221,10 @@ def legacy_mover_signal(df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
         55 <= r.iloc[-1] <= 80
     )
 
+    avg_vol = vS.iloc[-1] if not np.isnan(vS.iloc[-1]) else last["volume"]
     breakout = (
         last["close"] > hl and
-        last["volume"] >= (vS.iloc[-1] if not np.isnan(vS.iloc[-1]) else last["volume"])
+        last["volume"] >= min_rel_volume * avg_vol
     )
 
     if not (aligned and breakout):
@@ -215,6 +232,15 @@ def legacy_mover_signal(df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     entry = float(last["close"])
     stop = float(min(df1h["low"].iloc[-10:]))
+
+    # Risk filter: (entry - stop) / entry * 100 in %
+    if entry <= 0 or stop <= 0 or stop >= entry:
+        return None
+
+    risk_pct = (entry - stop) / entry * 100.0
+    if risk_pct < min_risk_pct or risk_pct > max_risk_pct:
+        # stop is either too tight or too wide -> skip
+        return None
 
     return {
         "type": "day",
@@ -257,13 +283,10 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
     """
     Evaluate all open silent signals and close them if stop/T1/T2 is hit.
 
-    Also logs:
-      - time_to_outcome_min  (first time any of stop/T1/T2 is reached)
-      - time_to_t1_min       (first time T1 is reached, even if outcome is T2 or stop)
-      - time_to_t2_min       (first time T2 is reached, if ever)
-
-    This version explicitly tracks first touches of T1/T2 before deciding outcome,
-    so timestamps are always recorded when levels are hit.
+    Logs:
+      - time_to_outcome_min
+      - time_to_t1_min
+      - time_to_t2_min
     """
     book = rds.load_json("state", "silent_open", default={})
     if not book:
@@ -281,28 +304,24 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
         t1 = tr.get("t1")
         t2 = tr.get("t2")
 
-        # Movers only: no bear logic here
         try:
             limit = 400 if tf in ("1h", "4h") else 330
             df = client.ohlcv(pair, tf, limit)
 
             opened_at = pd.to_datetime(tr["opened_at"], utc=True)
-            # start from the signal bar and forward
             df = df.loc[opened_at:]
-            # skip the signal bar itself; we only care about bars AFTER the entry bar
             rows = df.iloc[1:]
 
-            outcome = None       # "t1", "t2", "stop"
+            outcome = None
             exit_price = None
-            hit_ts = None        # time of final outcome
+            hit_ts = None
 
-            t1_ts = None         # first time T1 is ever touched
-            t2_ts = None         # first time T2 is ever touched
+            t1_ts = None
+            t2_ts = None
 
             for ts, r in rows.iterrows():
                 lo, hi = float(r["low"]), float(r["high"])
 
-                # Track first touches of T1/T2 (even if we later stop out)
                 if t1 is not None and hi >= t1 and t1_ts is None:
                     t1_ts = ts
                 if t2 is not None and hi >= t2 and t2_ts is None:
@@ -312,12 +331,9 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
                 touched_t1   = (t1 is not None and hi >= t1)
                 touched_t2   = (t2 is not None and hi >= t2)
 
-                # If nothing was hit this bar, continue
                 if not (touched_stop or touched_t1 or touched_t2):
                     continue
 
-                # Optimistic ordering inside a single candle:
-                # Prefer T2 > T1 > Stop if they occur in the same bar.
                 if touched_t2:
                     outcome = "t2"
                     exit_price = t2
@@ -331,7 +347,7 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
                     exit_price = stop
                     hit_ts = ts
 
-                break  # we stop at the first bar where any level is triggered
+                break
 
             if outcome:
                 tr["status"] = "closed"
@@ -339,7 +355,6 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
                 tr["outcome"] = outcome
                 tr["exit_price"] = float(exit_price)
 
-                # --- timing metrics ---
                 opened_ts = opened_at
 
                 if hit_ts is not None:
@@ -360,7 +375,6 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
                 else:
                     tr["time_to_t2_min"] = None
 
-                # --- R multiple (unchanged logic) ---
                 try:
                     entry = float(tr.get("entry"))
                     stop_val = tr.get("stop")
@@ -381,7 +395,7 @@ def close_silent_if_hit(rds: RedisState, client: ExClient, cfg: Dict[str, Any]):
 
     if changed:
         rds.save_json(book, "state", "silent_open")
-      
+
 def movers_stats_table(rds: RedisState):
     book = rds.load_json("state", "silent_open", default={})
     movers = [
@@ -410,13 +424,6 @@ def movers_stats_table(rds: RedisState):
     print("-------------------------------------------------")
 
 def movers_time_stats_table(rds: RedisState):
-    """
-    Time-to-target stats for Movers signals.
-
-    Uses:
-      - time_to_outcome_min when available
-      - otherwise falls back to (closed_at - opened_at) if both are present
-    """
     book = rds.load_json("state", "silent_open", default={})
 
     movers = [
@@ -434,7 +441,6 @@ def movers_time_stats_table(rds: RedisState):
                 return float(v)
             except Exception:
                 return None
-        # fallback: derive from opened_at / closed_at
         oa = tr.get("opened_at")
         ca = tr.get("closed_at")
         if not oa or not ca:
@@ -446,14 +452,12 @@ def movers_time_stats_table(rds: RedisState):
         except Exception:
             return None
 
-    # any closed trade where outcome is t1 or t2 or stop
     outcome_any = [
         _effective_outcome_minutes(tr)
         for tr in movers
     ]
     outcome_any = [v for v in outcome_any if v is not None]
 
-    # For T1/T2 we still rely only on explicit timing fields
     def _clean(values):
         return [float(v) for v in values if v is not None]
 
@@ -648,7 +652,6 @@ def fmt_mover_signal_block(sig: Dict[str, Any]) -> str:
     except Exception:
         entry = 0.0
 
-    # raw levels
     stop_raw = sig.get("stop")
     t1_raw = sig.get("t1")
     t2_raw = sig.get("t2")
@@ -657,7 +660,6 @@ def fmt_mover_signal_block(sig: Dict[str, Any]) -> str:
     t1 = float(t1_raw) if t1_raw is not None else None
     t2 = float(t2_raw) if t2_raw is not None else None
 
-    # Percent calculations (safe)
     risk_pct = None
     t1_pct = None
     t2_pct = None
@@ -683,7 +685,7 @@ def fmt_mover_signal_block(sig: Dict[str, Any]) -> str:
     def pct(x):
         return f"{x:.1f}%" if x is not None else "n/a"
 
-    direction = "Long"  # Movers are long breakout signals
+    direction = "Long"
 
     header = "**Kritocurrency Alpha Signals – Movers Signal 🚀**"
 
@@ -717,26 +719,20 @@ def run(cfg: Dict[str, Any]):
         ttl_minutes=int(cfg.get("persistence", {}).get("ttl_minutes", 2880)),
     )
 
-    # Discord hook
     SIG_HOOK = os.environ.get("DISCORD_SIGNALS_WEBHOOK") or cfg.get("discord", {}).get("signals_webhook", "")
 
-    # Filters
     extra_stables = cfg.get("filters", {}).get("extra_stables", [])
 
-    # Reporting
     reporting_cfg = cfg.get("reporting", {})
     movers_max_rows = int(reporting_cfg.get("movers_detailed_max_rows", 100))
 
-    # Movers config
     mv_cfg = cfg.get("movers", {"enabled": True})
     fb_cfg = cfg.get("fallback", {"enabled": False})
 
-    # Universe — Movers
     movers_syms = cmc_movers_symbols(cfg) if mv_cfg.get("enabled", True) else []
     movers_pairs = filter_pairs_on_mexc(client, movers_syms, mv_cfg.get("quote", "USDT"), extra_stables)
     print(f"[universe] Movers mapped -> {len(movers_pairs)} pairs")
 
-    # Optional fallback
     if fb_cfg.get("enabled", False) and len(movers_pairs) == 0:
         movers_pairs = mexc_top_usdt_volume_pairs(
             client,
@@ -752,7 +748,7 @@ def run(cfg: Dict[str, Any]):
     for pair in movers_pairs:
         try:
             df1h = client.ohlcv(pair, "1h", 260)
-            sig = legacy_mover_signal(df1h)
+            sig = legacy_mover_signal(df1h, mv_cfg=mv_cfg)
             if sig:
                 sig.update({"symbol": pair, "timeframe": "1h", "exchange": "mexc"})
                 if not is_silent_open_movers(rds, pair, "1h", sig["type"]):
