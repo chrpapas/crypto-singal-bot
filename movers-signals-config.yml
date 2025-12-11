@@ -45,7 +45,7 @@ movers:
   # - younger, more active coins
   min_change_24h: 10.0          # was 8.0
   min_volume_usd_24h: 10000000  # was 5,000,000
-  max_age_days: 730             # was 3650 (10 years)
+  max_age_days: 3650             # was 3650 (10 years)
 
   quote: "USDT"
 
