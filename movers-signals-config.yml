@@ -31,38 +31,47 @@ filters:
     - TRY
     - BRL
 
+persistence:
+  redis_url: ${REDIS_URL}
+  key_prefix: spideybot:v1
+  ttl_minutes: 2880  # selftest only
+
+discord:
+  signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}
+
+filters:
+  extra_stables: [EUR, EURS, TRY, BRL]
+
 movers:
   enabled: true
-
   cmc_api_key: ${CMC_API_KEY}
 
-  # Slightly smaller universe; let’s keep it tighter
-  limit: 400
-
-  # Tighter quality filters:
-  # - more price movement
-  # - more volume
-  # - younger, more active coins
-  min_change_24h: 10.0          # was 8.0
-  min_volume_usd_24h: 10000000  # was 5,000,000
-  max_age_days: 3650             # was 3650 (10 years)
-
+  # Universe size / quality
+  limit: 500
+  min_change_24h: 8.0
+  min_volume_usd_24h: 5000000
+  max_age_days: 3650
   quote: "USDT"
 
-  # New: risk filter for the stop distance vs entry
-  risk_filter:
-    # (entry - stop) / entry * 100 in %
-    min_risk_pct: 1.0   # skip ultra-tight stops (<1%)
-    max_risk_pct: 10.0  # skip super-wide stops (>10%)
+  # Signal filters (loosened a bit to restore frequency)
+  min_rel_volume: 1.05        # was 1.2
+  rsi_min: 52                 # was hardcoded 55
+  rsi_max: 82                 # was hardcoded 80
 
-  # New: volume confirmation factor
-  # last_volume must be >= min_rel_volume * 20-bar average volume
-  min_rel_volume: 1.2   # 1.0 = same as average, 1.2 = 20% above avg
+  risk_filter:
+    min_risk_pct: 0.8         # allow slightly tighter stops
+    max_risk_pct: 14.0        # allow wider stops so signals don’t get filtered out
+
+  # NEW: prevent “open forever” blocking
+  open_timeout_hours: 168     # 7 days; closes as outcome="timeout"
+
+  # NEW: if CMC mapping is tiny, auto-fallback
+  min_universe_pairs: 25
 
 fallback:
-  enabled: false
+  enabled: true
   min_usd_vol: 2000000
-  max_pairs: 80
+  max_pairs: 120
 
 reporting:
-  movers_detailed_max_rows: 10
+  movers_detailed_max_rows: 20
