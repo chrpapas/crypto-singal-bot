@@ -31,17 +31,6 @@ filters:
     - TRY
     - BRL
 
-persistence:
-  redis_url: ${REDIS_URL}
-  key_prefix: spideybot:v1
-  ttl_minutes: 2880  # selftest only
-
-discord:
-  signals_webhook: ${DISCORD_SIGNALS_WEBHOOK}
-
-filters:
-  extra_stables: [EUR, EURS, TRY, BRL]
-
 movers:
   enabled: true
   cmc_api_key: ${CMC_API_KEY}
