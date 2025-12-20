@@ -1,23 +1,23 @@
 import os
 import time
 import json
-import hashlib
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+import hashlib
+from typing import Any, Dict, Optional, List, Tuple
 
 import yaml
-import httpx
+import requests
 import numpy as np
 import pandas as pd
+import ccxt
 from redis import Redis
 
 
-# ----------------------------
-# Config + helpers
-# ----------------------------
+# =========================
+# Config helpers
+# =========================
 
-def load_config(path: str = "config.yaml") -> dict:
+def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -34,7 +34,6 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def timeframe_to_seconds(tf: str) -> int:
-    # Supports "1m", "5m", "15m", "1h", "4h", "1d"
     if tf.endswith("m"):
         return int(tf[:-1]) * 60
     if tf.endswith("h"):
@@ -49,17 +48,15 @@ def is_candle_closed(candle_open_ts: int, tf: str, now: Optional[int] = None) ->
     return (candle_open_ts + timeframe_to_seconds(tf)) <= now
 
 def round_price(x: float) -> float:
-    # Basic rounding to reduce noisy decimals (you can customize per symbol tick size later)
     if x == 0 or not math.isfinite(x):
         return x
-    # keep ~6 significant digits
     digits = max(0, 6 - int(math.floor(math.log10(abs(x)))) - 1)
     return round(x, digits)
 
 
-# ----------------------------
-# Redis keys
-# ----------------------------
+# =========================
+# Redis keys + primitives
+# =========================
 
 def k_lock(lock_key: str) -> str:
     return lock_key
@@ -76,10 +73,49 @@ def k_history(exchange: str, market: str, symbol: str, tf: str) -> str:
 def k_published(signal_id: str) -> str:
     return f"published:{signal_id}"
 
+def k_universe(exchange: str, market: str) -> str:
+    return f"universe:{exchange}:{market}"
 
-# ----------------------------
+def k_universe_ts(exchange: str, market: str) -> str:
+    return f"universe_ts:{exchange}:{market}"
+
+def acquire_lock(r: Redis, key: str, ttl: int) -> bool:
+    return bool(r.set(key, "1", nx=True, ex=ttl))
+
+def already_processed_candle(r: Redis, market: str, symbol: str, tf: str, candle_ts: int) -> bool:
+    """
+    Ensures we only process each (symbol, tf, latest candle ts) once.
+    """
+    key = k_last_candle(market, symbol, tf)
+    last = r.get(key)
+    if last is not None and int(last) >= candle_ts:
+        return True
+    r.set(key, str(candle_ts), ex=14 * 24 * 3600)
+    return False
+
+def write_signal_to_redis(r: Redis, sig: Dict[str, Any]) -> None:
+    key_latest = k_latest(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"])
+    key_hist = k_history(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"])
+    r.set(key_latest, json.dumps(sig), ex=6 * 3600)
+    r.lpush(key_hist, json.dumps(sig))
+    r.ltrim(key_hist, 0, 200)
+
+def mark_published(r: Redis, signal_id: str, ttl_days: int) -> bool:
+    return bool(r.set(k_published(signal_id), "1", nx=True, ex=ttl_days * 86400))
+
+def cooldown_key(exchange: str, market: str, symbol: str, tf: str, setup: str) -> str:
+    return f"cooldown:{exchange}:{market}:{symbol}:{tf}:{setup}"
+
+def set_cooldown(r: Redis, key: str, seconds: int) -> None:
+    r.set(key, "1", ex=seconds)
+
+def in_cooldown(r: Redis, key: str) -> bool:
+    return r.get(key) is not None
+
+
+# =========================
 # Indicators
-# ----------------------------
+# =========================
 
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
@@ -96,130 +132,273 @@ def atr(df: pd.DataFrame, n: int) -> pd.Series:
     return tr.rolling(n).mean()
 
 
-# ----------------------------
-# MEXC PERP OHLCV fetch (public)
-# ----------------------------
-# NOTE:
-# MEXC contract/perps endpoints differ across versions.
-# This function is isolated so you can easily swap it with your existing MEXC client call.
-#
-# Expected output df columns:
-#   ts (int, seconds), open, high, low, close, volume (floats)
-#
-# If this endpoint doesn't match your current integration, replace fetch_mexc_perp_ohlcv()
-# to call your existing MEXC API wrapper and return the same DataFrame format.
+# =========================
+# Discord (webhook)
+# =========================
 
-MEXC_HTTP_TIMEOUT = 15.0
+def format_discord_message(sig: Dict[str, Any]) -> str:
+    side = sig["side"]
+    sym = sig["symbol"]
+    tf = sig["timeframe"]
+    conf = sig["confidence"]
+    entry = sig["entry"]["price"]
+    stop = sig["exit"]["stop"]
+    tp1, tp2 = sig["exit"]["take_profit"]
 
-def mexc_tf_to_interval(tf: str) -> str:
-    # MEXC typically uses "Min1", "Min15", "Hour1" etc for some endpoints,
-    # others use "1m", "15m", "1h". Adjust as needed.
-    mapping = {
-        "1m": "1m",
-        "5m": "5m",
-        "15m": "15m",
-        "30m": "30m",
-        "1h": "1h",
-        "4h": "4h",
-        "1d": "1d",
-    }
-    if tf not in mapping:
-        raise ValueError(f"Unsupported timeframe: {tf}")
-    return mapping[tf]
+    risk = abs(entry - stop)
+    r1 = abs(tp1 - entry) / risk if risk > 0 else 0
+    r2 = abs(tp2 - entry) / risk if risk > 0 else 0
 
-async def fetch_mexc_perp_ohlcv(symbol: str, tf: str, limit: int) -> pd.DataFrame:
+    setup = sig.get("setup", "signal")
+
+    return (
+        f"**{setup}** | **{side}** `{sym}` • **{tf}** • conf: **{conf}**\n"
+        f"Entry (model: {sig.get('entry_model','signal_close')}): `{entry}`\n"
+        f"Stop: `{stop}`\n"
+        f"TP1: `{tp1}` (≈ {r1:.2f}R) | TP2: `{tp2}` (≈ {r2:.2f}R)\n"
+        f"Trail: `{sig['exit']['trail']['method']}` x `{sig['exit']['trail']['mult']}` "
+        f"(activation: `{sig['exit']['trail']['activation']}`)\n"
+        f"Invalidation: _{sig['invalidation']}_\n"
+        f"Signal ID: `{sig['signal_id']}`"
+    )
+
+def post_to_discord(webhook_url: str, content: str, username: str = "", avatar_url: str = "") -> None:
+    payload = {"content": content}
+    if username:
+        payload["username"] = username
+    if avatar_url:
+        payload["avatar_url"] = avatar_url
+    resp = requests.post(webhook_url, json=payload, timeout=15)
+    resp.raise_for_status()
+
+
+# =========================
+# CCXT: MEXC PERP data
+# =========================
+
+def build_mexc_client(cfg: dict) -> ccxt.Exchange:
+    mexc_cfg = cfg.get("mexc", {})
+    key_env = mexc_cfg.get("api_key_env", "MEXC_KEY")
+    sec_env = mexc_cfg.get("api_secret_env", "MEXC_SECRET")
+
+    api_key = os.environ.get(key_env, "")
+    api_secret = os.environ.get(sec_env, "")
+
+    ex = ccxt.mexc({
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",  # IMPORTANT for perps
+        },
+    })
+    return ex
+
+def normalize_symbol_for_ccxt(symbol: str) -> str:
     """
-    Tries a common style of MEXC contract kline endpoint.
-    If it fails in your environment, replace this with your own MEXC client.
+    Accepts:
+    - "BTC/USDT:USDT" (ideal for perps)
+    - "BTC_USDT" or "BTCUSDT" -> heuristics to "BTC/USDT:USDT"
     """
-    interval = mexc_tf_to_interval(tf)
+    s = symbol.strip()
 
-    # Common patterns seen in MEXC contract APIs:
-    # - https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval=...&limit=...
-    # - https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval=...&start=...&end=...
-    #
-    # We'll attempt a straightforward call:
-    base = "https://contract.mexc.com"
-    url = f"{base}/api/v1/contract/kline/{symbol}"
-    params = {"interval": interval, "limit": limit}
+    if ":" in s and "/" in s:
+        return s
 
-    async with httpx.AsyncClient(timeout=MEXC_HTTP_TIMEOUT) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
+    if "_" in s:
+        base, quote = s.split("_", 1)
+        quote_u = quote.upper()
+        return f"{base}/{quote_u}:{quote_u}"
 
-    # Expected data formats vary.
-    # We'll handle a couple of typical shapes.
+    if "/" in s:
+        base, quote = s.split("/", 1)
+        quote_u = quote.upper()
+        return f"{base}/{quote_u}:{quote_u}"
 
-    # Shape A: {"success":true,"data":[[ts,open,high,low,close,vol],...]}
-    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list) and data["data"] and isinstance(data["data"][0], list):
-        rows = data["data"]
-        # ts may be ms; normalize to seconds if needed
-        out = []
-        for r in rows:
-            ts = int(r[0])
-            if ts > 10_000_000_000:  # ms
-                ts //= 1000
-            out.append({
-                "ts": ts,
-                "open": float(r[1]),
-                "high": float(r[2]),
-                "low": float(r[3]),
-                "close": float(r[4]),
-                "volume": float(r[5]) if len(r) > 5 else 0.0,
-            })
-        df = pd.DataFrame(out)
+    if s.endswith("USDT") and len(s) > 4:
+        base = s[:-4]
+        return f"{base}/USDT:USDT"
 
-    # Shape B: {"data":{"time":[...],"open":[...],...}}
-    elif isinstance(data, dict) and "data" in data and isinstance(data["data"], dict) and "time" in data["data"]:
-        d = data["data"]
-        out = []
-        for i in range(len(d["time"])):
-            ts = int(d["time"][i])
-            if ts > 10_000_000_000:
-                ts //= 1000
-            out.append({
-                "ts": ts,
-                "open": float(d["open"][i]),
-                "high": float(d["high"][i]),
-                "low": float(d["low"][i]),
-                "close": float(d["close"][i]),
-                "volume": float(d["vol"][i]) if "vol" in d else float(d.get("volume", [0]*len(d["time"]))[i]),
-            })
-        df = pd.DataFrame(out)
+    return s
 
-    else:
-        raise RuntimeError(f"Unrecognized MEXC kline response shape: {str(data)[:300]}")
+def fetch_ohlcv_ccxt(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    ccxt_symbol = normalize_symbol_for_ccxt(symbol)
+    ohlcv = ex.fetch_ohlcv(ccxt_symbol, timeframe=timeframe, limit=limit)
+    if not ohlcv:
+        raise RuntimeError(f"No OHLCV returned for {ccxt_symbol} {timeframe}")
 
-    df = df.dropna().sort_values("ts").reset_index(drop=True)
+    out = []
+    for row in ohlcv:
+        ms = int(row[0])
+        ts = ms // 1000
+        out.append({
+            "ts": ts,
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]) if len(row) > 5 else 0.0,
+        })
+
+    df = pd.DataFrame(out).dropna().sort_values("ts").reset_index(drop=True)
     return df
 
 
-# ----------------------------
+# =========================
+# Universe (broad scan)
+# =========================
+
+def build_universe_symbols(ex: ccxt.Exchange, cfg: dict) -> List[str]:
+    ucfg = cfg.get("universe", {})
+    quote = (ucfg.get("quote", "USDT") or "USDT").upper()
+    require_colon_quote = bool(ucfg.get("require_colon_quote", True))
+    top_n = int(ucfg.get("top_n", 200))
+    min_qv = float(ucfg.get("min_quote_volume_usdt", 0))
+    whitelist = set(ucfg.get("whitelist", []) or [])
+    blacklist = set(ucfg.get("blacklist", []) or [])
+
+    markets = ex.markets or {}
+    candidates: List[str] = []
+
+    for sym, m in markets.items():
+        if not m:
+            continue
+        if not m.get("active", True):
+            continue
+
+        # swaps/perps only
+        if m.get("type") != "swap" and not m.get("swap", False):
+            continue
+
+        # quote filter
+        if (m.get("quote") or "").upper() != quote:
+            continue
+
+        # skip inverse if flagged
+        if m.get("inverse", False) is True:
+            continue
+
+        if require_colon_quote and f":{quote}" not in sym:
+            continue
+
+        if whitelist and sym not in whitelist:
+            continue
+        if sym in blacklist:
+            continue
+
+        candidates.append(sym)
+
+    if not candidates:
+        return []
+
+    # Rank by quote volume
+    tickers = {}
+    try:
+        # some exchanges allow passing a list; if it fails, fall back to full tickers
+        tickers = ex.fetch_tickers(candidates)
+    except Exception:
+        tickers = ex.fetch_tickers()
+
+    scored: List[Tuple[str, float]] = []
+    for sym in candidates:
+        t = tickers.get(sym) or {}
+        qv = t.get("quoteVolume")
+
+        if qv is None:
+            bv = t.get("baseVolume")
+            last = t.get("last")
+            if bv is not None and last is not None:
+                try:
+                    qv = float(bv) * float(last)
+                except Exception:
+                    qv = None
+
+        if qv is None:
+            continue
+
+        qv = float(qv)
+        if qv < min_qv:
+            continue
+
+        scored.append((sym, qv))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in scored[:top_n]]
+
+def get_universe_symbols_cached(r: Redis, ex: ccxt.Exchange, cfg: dict, exchange: str, market: str) -> List[str]:
+    ucfg = cfg.get("universe", {})
+    refresh = int(ucfg.get("refresh_seconds", 3600))
+
+    ts_key = k_universe_ts(exchange, market)
+    uni_key = k_universe(exchange, market)
+
+    last_ts = r.get(ts_key)
+    if last_ts is not None:
+        age = now_ts() - int(last_ts)
+        if age < refresh:
+            raw = r.get(uni_key)
+            if raw:
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    pass
+
+    syms = build_universe_symbols(ex, cfg)
+    r.set(ts_key, str(now_ts()), ex=7 * 24 * 3600)
+    r.set(uni_key, json.dumps(syms), ex=7 * 24 * 3600)
+    return syms
+
+def shard_symbols(r: Redis, symbols: List[str], cfg: dict) -> List[str]:
+    """
+    Returns a rotating slice of the universe so each cron run scans only a subset.
+    """
+    ucfg = cfg.get("universe", {})
+    shard_cfg = (ucfg.get("shard", {}) or {})
+    if not bool(shard_cfg.get("enable", True)):
+        return symbols
+
+    per_run = int(shard_cfg.get("symbols_per_run", 60))
+    step = int(shard_cfg.get("step", per_run))
+    state_key = shard_cfg.get("state_key", "universe_shard_index")
+
+    n = len(symbols)
+    if n == 0:
+        return []
+
+    # current index in Redis
+    idx_raw = r.get(state_key)
+    idx = int(idx_raw) if idx_raw is not None else 0
+    idx = idx % n
+
+    # slice with wrap-around
+    end = idx + per_run
+    if end <= n:
+        chunk = symbols[idx:end]
+    else:
+        chunk = symbols[idx:] + symbols[:(end % n)]
+
+    # advance index
+    next_idx = (idx + step) % n
+    r.set(state_key, str(next_idx), ex=30 * 24 * 3600)
+
+    return chunk
+
+
+# =========================
 # Strategy: Trend Pullback v1
-# ----------------------------
+# =========================
 
-@dataclass
-class Signal:
-    signal_id: str
-    payload: Dict[str, Any]
-
-def compute_confidence(df: pd.DataFrame, side: str, ema_trend_col: str, atr_col: str) -> float:
-    """
-    Simple, stable confidence:
-    - More distance from EMA200 in direction of trend (normalized by ATR) increases confidence.
-    - Too close to EMA200 reduces confidence (chop risk).
-    """
+def compute_confidence(df: pd.DataFrame, side: str) -> float:
     last = df.iloc[-1]
-    atrv = float(last[atr_col])
+    atrv = float(last["atr"])
     if not math.isfinite(atrv) or atrv <= 0:
         return 0.0
-    dist = (float(last["close"]) - float(last[ema_trend_col])) / atrv
-    # For shorts, invert dist
+
+    dist = (float(last["close"]) - float(last["ema_trend"])) / atrv
     if side == "SHORT":
         dist = -dist
-    # Map dist roughly to [0,1] with a soft cap
-    # dist ~ 0.5 => ok, dist ~ 2 => strong
+
+    # dist ~ 0.5 ok, dist ~ 2 strong
     score = 1 / (1 + math.exp(-(dist - 0.5)))
     return float(np.clip(score, 0.0, 1.0))
 
@@ -230,13 +409,13 @@ def build_trend_pullback_signal(
     tf: str,
     exchange: str,
     market: str,
-) -> Optional[Signal]:
+) -> Optional[Dict[str, Any]]:
     s_cfg = cfg["strategy"]
+
     ema_fast_n = int(s_cfg["ema_fast"])
     ema_trend_n = int(s_cfg["ema_trend"])
     atr_n = int(s_cfg["atr_period"])
 
-    # Need enough data
     if len(df) < max(ema_trend_n, atr_n) + 5:
         return None
 
@@ -248,7 +427,6 @@ def build_trend_pullback_signal(
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Only signal on CLOSED candle
     candle_ts = int(last["ts"])
     if not is_candle_closed(candle_ts, tf):
         return None
@@ -264,7 +442,6 @@ def build_trend_pullback_signal(
     trend_up = close > ema_trend_v
     trend_down = close < ema_trend_v
 
-    # Pullback + reclaim EMA_fast
     pullback_long = (
         trend_up
         and float(prev["close"]) < float(prev["ema_fast"])
@@ -280,9 +457,7 @@ def build_trend_pullback_signal(
         return None
 
     side = "LONG" if pullback_long else "SHORT"
-
-    # Entry model: signal candle close (deterministic, easy)
-    entry = close
+    entry = close  # deterministic model (signal close)
 
     stop_mult = float(s_cfg["stop_atr_mult"])
     tp1_r = float(s_cfg["tp1_r"])
@@ -297,9 +472,8 @@ def build_trend_pullback_signal(
     tp1 = entry + tp1_r * risk if side == "LONG" else entry - tp1_r * risk
     tp2 = entry + tp2_r * risk if side == "LONG" else entry - tp2_r * risk
 
-    confidence = compute_confidence(df, side, "ema_trend", "atr")
+    confidence = compute_confidence(df, side)
 
-    # signal_id deterministic (so we can prove “no edits” later)
     raw_id = json.dumps({
         "exchange": exchange,
         "market": market,
@@ -311,7 +485,7 @@ def build_trend_pullback_signal(
     }, sort_keys=True)
     signal_id = sha256_hex(raw_id)[:24]
 
-    payload = {
+    sig = {
         "signal_id": signal_id,
         "ts": candle_ts,
         "exchange": exchange,
@@ -332,155 +506,111 @@ def build_trend_pullback_signal(
                 "activation": "after_tp1" if bool(s_cfg.get("trail_activate_after_tp1", True)) else "immediate",
             },
         },
-        "invalidation": f"Close crosses EMA{int(s_cfg['ema_trend'])} against direction",
+        "invalidation": f"Close crosses EMA{ema_trend_n} against direction",
         "rationale": [
-            f"Trend filter: close vs EMA{int(s_cfg['ema_trend'])}",
-            f"Pullback reclaim EMA{int(s_cfg['ema_fast'])}",
-            f"ATR({int(s_cfg['atr_period'])}) risk model",
+            f"Trend filter: close vs EMA{ema_trend_n}",
+            f"Pullback reclaim EMA{ema_fast_n}",
+            f"ATR({atr_n}) risk model",
         ],
     }
-
-    return Signal(signal_id=signal_id, payload=payload)
-
-
-# ----------------------------
-# Discord publishing
-# ----------------------------
-
-def format_discord_message(sig: Dict[str, Any]) -> str:
-    side = sig["side"]
-    sym = sig["symbol"]
-    tf = sig["timeframe"]
-    conf = sig["confidence"]
-    entry = sig["entry"]["price"]
-    stop = sig["exit"]["stop"]
-    tp1, tp2 = sig["exit"]["take_profit"]
-
-    # quick RR display
-    risk = abs(entry - stop)
-    r1 = abs(tp1 - entry) / risk if risk > 0 else 0
-    r2 = abs(tp2 - entry) / risk if risk > 0 else 0
-
-    return (
-        f"**{side}** `{sym}`  •  **{tf}**  •  conf: **{conf}**\n"
-        f"Entry: `{entry}`\n"
-        f"Stop: `{stop}`\n"
-        f"TP1: `{tp1}`  (≈ {r1:.2f}R)\n"
-        f"TP2: `{tp2}`  (≈ {r2:.2f}R)\n"
-        f"Invalidation: _{sig['invalidation']}_\n"
-        f"Signal ID: `{sig['signal_id']}`"
-    )
-
-async def post_to_discord(webhook_url: str, content: str, username: str = "", avatar_url: str = "") -> None:
-    payload = {"content": content}
-    if username:
-        payload["username"] = username
-    if avatar_url:
-        payload["avatar_url"] = avatar_url
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(webhook_url, json=payload)
-        resp.raise_for_status()
+    return sig
 
 
-# ----------------------------
-# Main cron run
-# ----------------------------
+# =========================
+# Main cron run (sync)
+# =========================
 
-def acquire_lock(r: Redis, key: str, ttl: int) -> bool:
-    # True if lock acquired
-    return bool(r.set(key, "1", nx=True, ex=ttl))
+def run_once(config_path: str = "candlepilot.config.yaml") -> None:
+    cfg = load_config(config_path)
 
-def already_processed_candle(r: Redis, market: str, symbol: str, tf: str, candle_ts: int) -> bool:
-    key = k_last_candle(market, symbol, tf)
-    last = r.get(key)
-    if last is not None and int(last) >= candle_ts:
-        return True
-    r.set(key, str(candle_ts), ex=14 * 24 * 3600)  # keep 2 weeks
-    return False
-
-def write_signal_to_redis(r: Redis, sig: Dict[str, Any]) -> None:
-    key_latest = k_latest(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"])
-    key_hist = k_history(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"])
-    r.set(key_latest, json.dumps(sig), ex=6 * 3600)  # 6h
-    r.lpush(key_hist, json.dumps(sig))
-    r.ltrim(key_hist, 0, 200)
-
-def mark_published(r: Redis, signal_id: str, ttl_days: int) -> bool:
-    # returns True if newly marked (not published before)
-    return bool(r.set(k_published(signal_id), "1", nx=True, ex=ttl_days * 86400))
-
-async def run_once() -> None:
-    cfg = load_config("config.yaml")
-
+    # Redis
     redis_url = env_required(cfg["redis"]["url_env"])
     r = Redis.from_url(redis_url, decode_responses=True, socket_timeout=10)
 
-    # lock
+    # Lock
     lock_key = cfg["app"]["lock_key"]
     lock_ttl = int(cfg["app"]["lock_ttl_seconds"])
     if not acquire_lock(r, k_lock(lock_key), lock_ttl):
+        print("[INFO] lock not acquired; exiting")
         return
 
-    # Discord webhook
+    # Discord
     webhook_url = env_required(cfg["discord"]["webhook_url_env"])
     discord_username = cfg["discord"].get("username", "")
     discord_avatar = cfg["discord"].get("avatar_url", "")
 
-    exchange = cfg["market"]["exchange"]
+    exchange_name = cfg["market"]["exchange"]
     market = cfg["market"]["market_type"]
-    symbols = cfg["market"]["symbols"]
-    tfs = cfg["market"]["timeframes"]
+    tfs: List[str] = cfg["market"]["timeframes"]
 
     limit = int(cfg["strategy"]["candles_limit"])
     min_conf = float(cfg["strategy"]["min_confidence"])
     pub_ttl_days = int(cfg["publishing"]["published_ttl_days"])
+    cooldown_candles = int(cfg.get("publishing", {}).get("cooldown_candles", 0))
 
-    posted_count = 0
+    # Build exchange
+    ex = build_mexc_client(cfg)
+
+    try:
+        ex.load_markets()
+    except Exception as e:
+        print(f"[WARN] load_markets failed: {repr(e)} (continuing)")
+
+    # Universe symbols
+    symbols: List[str] = []
+    if cfg.get("universe", {}).get("enable", False):
+        symbols = get_universe_symbols_cached(r, ex, cfg, exchange_name, market)
+    else:
+        # fallback if you disable universe mode
+        symbols = cfg["market"].get("symbols", []) or []
+
+    # Shard symbols per run to avoid rate limits/timeouts
+    scan_symbols = shard_symbols(r, symbols, cfg)
+
+    posted = 0
+    scanned = 0
+    errors = 0
 
     for tf in tfs:
-        for symbol in symbols:
+        for symbol in scan_symbols:
+            scanned += 1
             try:
-                # Fetch candles (perps)
-                df = await fetch_mexc_perp_ohlcv(symbol, tf, limit=limit)
-
-                # Ensure newest candle is closed before generating signals
+                df = fetch_ohlcv_ccxt(ex, symbol, tf, limit=limit)
                 last_ts = int(df.iloc[-1]["ts"])
-                if not is_candle_closed(last_ts, tf):
-                    # If last isn't closed, try previous (closed) candle for gating.
-                    # We still compute signal on df as-is, but build_signal checks close anyway.
-                    pass
 
-                # Dedupe per (symbol, tf, candle)
-                # Only proceed if candle advanced
+                # Per-(symbol,tf) candle gating
                 if already_processed_candle(r, market, symbol, tf, last_ts):
-                    # Might still produce a signal on a prior closed candle;
-                    # but to keep MVP simple, we gate on the latest candle timestamp.
                     continue
 
-                sig_obj = build_trend_pullback_signal(cfg, df, symbol, tf, exchange, market)
-                if not sig_obj:
+                sig = build_trend_pullback_signal(cfg, df, symbol, tf, exchange_name, market)
+                if not sig:
                     continue
 
-                sig = sig_obj.payload
                 if float(sig["confidence"]) < min_conf:
                     continue
 
-                # Store in Redis
+                # Cooldown by candles (optional anti-spam)
+                if cooldown_candles > 0:
+                    cd_seconds = cooldown_candles * timeframe_to_seconds(tf)
+                    cd_key = cooldown_key(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"], sig["setup"])
+                    if in_cooldown(r, cd_key):
+                        continue
+                    set_cooldown(r, cd_key, cd_seconds)
+
+                # Store + publish
                 write_signal_to_redis(r, sig)
 
-                # Publish to Discord (dedupe by signal_id)
                 if mark_published(r, sig["signal_id"], pub_ttl_days):
                     msg = format_discord_message(sig)
-                    await post_to_discord(webhook_url, msg, username=discord_username, avatar_url=discord_avatar)
-                    posted_count += 1
+                    post_to_discord(webhook_url, msg, username=discord_username, avatar_url=discord_avatar)
+                    posted += 1
 
             except Exception as e:
-                # Keep cron robust; log and continue
+                errors += 1
                 print(f"[ERROR] {symbol} {tf}: {repr(e)}")
 
-    print(f"[DONE] posted={posted_count}")
+    print(f"[DONE] universe={len(symbols)} scanned={scanned} posted={posted} errors={errors}")
+
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(run_once())
+    run_once("candlepilot.config.yaml")
