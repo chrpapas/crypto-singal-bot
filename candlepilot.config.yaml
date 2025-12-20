@@ -1,20 +1,17 @@
 app:
   name: "candlepilot"
-  # Cron runs every minute; lock prevents overlaps.
   lock_key: "lock:cron"
   lock_ttl_seconds: 55
 
 redis:
-  # Use Render env var REDIS_URL (Upstash TCP/TLS often starts with rediss://)
-  url_env: "rediss://default:AZxQAAIncDE4NzYxM2Y1OTllNjA0YmQ3OGZlMmMwMzhjZGIwYTMzNnAxNDAwMTY@ideal-zebra-40016.upstash.io:6379"
+  url_env: "REDIS_URL"
 
 discord:
-  webhook_url_env: "https://discord.com/api/webhooks/1452030981182849086/fybhwkHm2Rnv216adRl6xHSVpwiPVRy3VdOSYHJq92eTbKcuGVY6hldYfSQjpOAnl2qj"
-  username: "Signal Bot"
+  webhook_url_env: "DISCORD_WEBHOOK_URL"
+  username: "CandlePilot"
   avatar_url: ""
 
 mexc:
-  # If your existing client already handles auth, you can ignore these env vars.
   api_key_env: "MEXC_KEY"
   api_secret_env: "MEXC_SECRET"
 
