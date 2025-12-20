@@ -1,0 +1,51 @@
+app:
+  name: "mexc-signal-bot"
+  # Cron runs every minute; lock prevents overlaps.
+  lock_key: "lock:cron"
+  lock_ttl_seconds: 55
+
+redis:
+  # Use Render env var REDIS_URL (Upstash TCP/TLS often starts with rediss://)
+  url_env: "REDIS_URL"
+
+discord:
+  webhook_url_env: "DISCORD_WEBHOOK_URL"
+  username: "Signal Bot"
+  avatar_url: ""
+
+mexc:
+  # If your existing client already handles auth, you can ignore these env vars.
+  api_key_env: "MEXC_KEY"
+  api_secret_env: "MEXC_SECRET"
+
+market:
+  exchange: "mexc"
+  market_type: "perp"   # "perp" for perps signals
+  symbols:
+    - "BTC_USDT"
+    - "ETH_USDT"
+  timeframes:
+    - "15m"
+    - "1h"
+
+strategy:
+  name: "trend_pullback_v1"
+  min_confidence: 0.65
+
+  ema_fast: 20
+  ema_trend: 200
+  atr_period: 14
+
+  # Risk / exits
+  stop_atr_mult: 2.5
+  tp1_r: 1.5
+  tp2_r: 3.0
+  trail_atr_mult: 2.5
+  trail_activate_after_tp1: true
+
+  # Data needs
+  candles_limit: 300
+
+publishing:
+  # Prevents spamming the same signal repeatedly
+  published_ttl_days: 7
