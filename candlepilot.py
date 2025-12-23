@@ -84,7 +84,7 @@ def acquire_lock(r: Redis, key: str, ttl: int) -> bool:
 
 def already_processed_candle(r: Redis, market: str, symbol: str, tf: str, candle_ts: int) -> bool:
     """
-    Ensures we only process each (symbol, tf, latest candle ts) once.
+    Ensures we only process each (symbol, tf, latest CLOSED candle ts) once.
     """
     key = k_last_candle(market, symbol, tf)
     last = r.get(key)
@@ -243,6 +243,18 @@ def fetch_ohlcv_ccxt(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int)
     df = pd.DataFrame(out).dropna().sort_values("ts").reset_index(drop=True)
     return df
 
+def latest_closed_candle_ts(df: pd.DataFrame, tf: str) -> int:
+    """
+    Returns the open timestamp (sec) of the latest CLOSED candle in df.
+    If the last candle is still forming, use the previous one.
+    """
+    if len(df) < 2:
+        return int(df.iloc[-1]["ts"])
+    last_ts = int(df.iloc[-1]["ts"])
+    if is_candle_closed(last_ts, tf):
+        return last_ts
+    return int(df.iloc[-2]["ts"])
+
 
 # =========================
 # Universe (broad scan)
@@ -292,9 +304,7 @@ def build_universe_symbols(ex: ccxt.Exchange, cfg: dict) -> List[str]:
         return []
 
     # Rank by quote volume
-    tickers = {}
     try:
-        # some exchanges allow passing a list; if it fails, fall back to full tickers
         tickers = ex.fetch_tickers(candidates)
     except Exception:
         tickers = ex.fetch_tickers()
@@ -349,9 +359,6 @@ def get_universe_symbols_cached(r: Redis, ex: ccxt.Exchange, cfg: dict, exchange
     return syms
 
 def shard_symbols(r: Redis, symbols: List[str], cfg: dict) -> List[str]:
-    """
-    Returns a rotating slice of the universe so each cron run scans only a subset.
-    """
     ucfg = cfg.get("universe", {})
     shard_cfg = (ucfg.get("shard", {}) or {})
     if not bool(shard_cfg.get("enable", True)):
@@ -365,19 +372,16 @@ def shard_symbols(r: Redis, symbols: List[str], cfg: dict) -> List[str]:
     if n == 0:
         return []
 
-    # current index in Redis
     idx_raw = r.get(state_key)
     idx = int(idx_raw) if idx_raw is not None else 0
     idx = idx % n
 
-    # slice with wrap-around
     end = idx + per_run
     if end <= n:
         chunk = symbols[idx:end]
     else:
         chunk = symbols[idx:] + symbols[:(end % n)]
 
-    # advance index
     next_idx = (idx + step) % n
     r.set(state_key, str(next_idx), ex=30 * 24 * 3600)
 
@@ -398,7 +402,6 @@ def compute_confidence(df: pd.DataFrame, side: str) -> float:
     if side == "SHORT":
         dist = -dist
 
-    # dist ~ 0.5 ok, dist ~ 2 strong
     score = 1 / (1 + math.exp(-(dist - 0.5)))
     return float(np.clip(score, 0.0, 1.0))
 
@@ -457,7 +460,7 @@ def build_trend_pullback_signal(
         return None
 
     side = "LONG" if pullback_long else "SHORT"
-    entry = close  # deterministic model (signal close)
+    entry = close
 
     stop_mult = float(s_cfg["stop_atr_mult"])
     tp1_r = float(s_cfg["tp1_r"])
@@ -523,18 +526,15 @@ def build_trend_pullback_signal(
 def run_once(config_path: str = "candlepilot.config.yaml") -> None:
     cfg = load_config(config_path)
 
-    # Redis
     redis_url = env_required(cfg["redis"]["url_env"])
     r = Redis.from_url(redis_url, decode_responses=True, socket_timeout=10)
 
-    # Lock
     lock_key = cfg["app"]["lock_key"]
     lock_ttl = int(cfg["app"]["lock_ttl_seconds"])
     if not acquire_lock(r, k_lock(lock_key), lock_ttl):
         print("[INFO] lock not acquired; exiting")
         return
 
-    # Discord
     webhook_url = env_required(cfg["discord"]["webhook_url_env"])
     discord_username = cfg["discord"].get("username", "")
     discord_avatar = cfg["discord"].get("avatar_url", "")
@@ -548,23 +548,18 @@ def run_once(config_path: str = "candlepilot.config.yaml") -> None:
     pub_ttl_days = int(cfg["publishing"]["published_ttl_days"])
     cooldown_candles = int(cfg.get("publishing", {}).get("cooldown_candles", 0))
 
-    # Build exchange
     ex = build_mexc_client(cfg)
-
     try:
         ex.load_markets()
     except Exception as e:
         print(f"[WARN] load_markets failed: {repr(e)} (continuing)")
 
     # Universe symbols
-    symbols: List[str] = []
     if cfg.get("universe", {}).get("enable", False):
         symbols = get_universe_symbols_cached(r, ex, cfg, exchange_name, market)
     else:
-        # fallback if you disable universe mode
         symbols = cfg["market"].get("symbols", []) or []
 
-    # Shard symbols per run to avoid rate limits/timeouts
     scan_symbols = shard_symbols(r, symbols, cfg)
 
     posted = 0
@@ -576,20 +571,24 @@ def run_once(config_path: str = "candlepilot.config.yaml") -> None:
             scanned += 1
             try:
                 df = fetch_ohlcv_ccxt(ex, symbol, tf, limit=limit)
-                last_ts = int(df.iloc[-1]["ts"])
 
-                # Per-(symbol,tf) candle gating
-                if already_processed_candle(r, market, symbol, tf, last_ts):
+                # Use latest CLOSED candle ts for gating
+                closed_ts = latest_closed_candle_ts(df, tf)
+
+                # gate per closed candle
+                if already_processed_candle(r, market, symbol, tf, closed_ts):
                     continue
 
-                sig = build_trend_pullback_signal(cfg, df, symbol, tf, exchange_name, market)
+                # evaluate only up to closed candle (avoid using forming candle)
+                df_eval = df[df["ts"] <= closed_ts].copy()
+
+                sig = build_trend_pullback_signal(cfg, df_eval, symbol, tf, exchange_name, market)
                 if not sig:
                     continue
 
                 if float(sig["confidence"]) < min_conf:
                     continue
 
-                # Cooldown by candles (optional anti-spam)
                 if cooldown_candles > 0:
                     cd_seconds = cooldown_candles * timeframe_to_seconds(tf)
                     cd_key = cooldown_key(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"], sig["setup"])
@@ -597,7 +596,6 @@ def run_once(config_path: str = "candlepilot.config.yaml") -> None:
                         continue
                     set_cooldown(r, cd_key, cd_seconds)
 
-                # Store + publish
                 write_signal_to_redis(r, sig)
 
                 if mark_published(r, sig["signal_id"], pub_ttl_days):
