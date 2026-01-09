@@ -53,10 +53,17 @@ def round_price(x: float) -> float:
     digits = max(0, 6 - int(math.floor(math.log10(abs(x)))) - 1)
     return round(x, digits)
 
+def clamp(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
 
 # =========================
-# Redis keys + primitives
+# Redis keys
 # =========================
+
+def strategy_key(cfg: dict) -> str:
+    s = cfg["strategy"]
+    return f"{s['name']}:{s.get('version','v0')}"
 
 def k_lock(lock_key: str) -> str:
     return lock_key
@@ -79,27 +86,28 @@ def k_universe(exchange: str, market: str) -> str:
 def k_universe_ts(exchange: str, market: str) -> str:
     return f"universe_ts:{exchange}:{market}"
 
-# Performance keys
-def k_open_set() -> str:
-    return "trade:open:set"
+# Performance keys (versioned)
+def k_open_set(sk: str) -> str:
+    return f"trade:open:set:{sk}"
 
-def k_open_trade(signal_id: str) -> str:
-    return f"trade:open:{signal_id}"
+def k_open_trade(sk: str, signal_id: str) -> str:
+    return f"trade:open:{sk}:{signal_id}"
 
-def k_closed_list() -> str:
-    return "trade:closed"  # append-only list (LPUSH)
+def k_closed_list(sk: str) -> str:
+    return f"trade:closed:{sk}"  # append-only list (LPUSH)
 
-def k_metrics_global() -> str:
-    return "metrics:global"
+def k_metrics(sk: str) -> str:
+    return f"metrics:{sk}"
 
+
+# =========================
+# Redis primitives
+# =========================
 
 def acquire_lock(r: Redis, key: str, ttl: int) -> bool:
     return bool(r.set(key, "1", nx=True, ex=ttl))
 
 def already_processed_candle(r: Redis, market: str, symbol: str, tf: str, candle_ts: int) -> bool:
-    """
-    Ensures we only process each (symbol, tf, latest CLOSED candle ts) once.
-    """
     key = k_last_candle(market, symbol, tf)
     last = r.get(key)
     if last is not None and int(last) >= candle_ts:
@@ -117,8 +125,8 @@ def write_signal_to_redis(r: Redis, sig: Dict[str, Any]) -> None:
 def mark_published(r: Redis, signal_id: str, ttl_days: int) -> bool:
     return bool(r.set(k_published(signal_id), "1", nx=True, ex=ttl_days * 86400))
 
-def cooldown_key(exchange: str, market: str, symbol: str, tf: str, setup: str) -> str:
-    return f"cooldown:{exchange}:{market}:{symbol}:{tf}:{setup}"
+def cooldown_key(exchange: str, market: str, symbol: str, tf: str, setup: str, sk: str) -> str:
+    return f"cooldown:{sk}:{exchange}:{market}:{symbol}:{tf}:{setup}"
 
 def set_cooldown(r: Redis, key: str, seconds: int) -> None:
     r.set(key, "1", ex=seconds)
@@ -147,7 +155,7 @@ def atr(df: pd.DataFrame, n: int) -> pd.Series:
 
 
 # =========================
-# Discord (webhook)
+# Discord
 # =========================
 
 def format_discord_message(sig: Dict[str, Any]) -> str:
@@ -164,11 +172,11 @@ def format_discord_message(sig: Dict[str, Any]) -> str:
     r2 = abs(tp2 - entry) / risk if risk > 0 else 0
 
     setup = sig.get("setup", "signal")
+    ver = sig.get("strategy_version", "")
 
     return (
-        f"**{setup}** | **{side}** `{sym}` • **{tf}** • conf: **{conf}**\n"
-        f"Entry (model: {sig.get('entry_model','signal_close')}): `{entry}`\n"
-        f"Stop: `{stop}`\n"
+        f"**{setup}** `{ver}` | **{side}** `{sym}` • **{tf}** • conf: **{conf}**\n"
+        f"Entry: `{entry}` | Stop: `{stop}`\n"
         f"TP1: `{tp1}` (≈ {r1:.2f}R) | TP2: `{tp2}` (≈ {r2:.2f}R)\n"
         f"Trail: `{sig['exit']['trail']['method']}` x `{sig['exit']['trail']['mult']}` "
         f"(activation: `{sig['exit']['trail']['activation']}`)\n"
@@ -187,7 +195,7 @@ def post_to_discord(webhook_url: str, content: str, username: str = "", avatar_u
 
 
 # =========================
-# CCXT: MEXC PERP data
+# CCXT: MEXC perps
 # =========================
 
 def build_mexc_client(cfg: dict) -> ccxt.Exchange:
@@ -198,36 +206,28 @@ def build_mexc_client(cfg: dict) -> ccxt.Exchange:
     api_key = os.environ.get(key_env, "")
     api_secret = os.environ.get(sec_env, "")
 
-    ex = ccxt.mexc({
+    return ccxt.mexc({
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",  # IMPORTANT for perps
-        },
+        "options": {"defaultType": "swap"},
     })
-    return ex
 
 def normalize_symbol_for_ccxt(symbol: str) -> str:
     s = symbol.strip()
-
     if ":" in s and "/" in s:
         return s
-
     if "_" in s:
         base, quote = s.split("_", 1)
         quote_u = quote.upper()
         return f"{base}/{quote_u}:{quote_u}"
-
     if "/" in s:
         base, quote = s.split("/", 1)
         quote_u = quote.upper()
         return f"{base}/{quote_u}:{quote_u}"
-
     if s.endswith("USDT") and len(s) > 4:
         base = s[:-4]
         return f"{base}/USDT:USDT"
-
     return s
 
 def fetch_ohlcv_ccxt(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
@@ -248,25 +248,17 @@ def fetch_ohlcv_ccxt(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int)
             "close": float(row[4]),
             "volume": float(row[5]) if len(row) > 5 else 0.0,
         })
-
-    df = pd.DataFrame(out).dropna().sort_values("ts").reset_index(drop=True)
-    return df
+    return pd.DataFrame(out).dropna().sort_values("ts").reset_index(drop=True)
 
 def latest_closed_candle_ts(df: pd.DataFrame, tf: str) -> int:
-    """
-    Returns open timestamp (sec) of the latest CLOSED candle.
-    If the last candle is still forming, use previous candle.
-    """
     if len(df) < 2:
         return int(df.iloc[-1]["ts"])
     last_ts = int(df.iloc[-1]["ts"])
-    if is_candle_closed(last_ts, tf):
-        return last_ts
-    return int(df.iloc[-2]["ts"])
+    return last_ts if is_candle_closed(last_ts, tf) else int(df.iloc[-2]["ts"])
 
 
 # =========================
-# Universe (broad scan)
+# Universe
 # =========================
 
 def build_universe_symbols(ex: ccxt.Exchange, cfg: dict) -> List[str]:
@@ -282,9 +274,7 @@ def build_universe_symbols(ex: ccxt.Exchange, cfg: dict) -> List[str]:
     candidates: List[str] = []
 
     for sym, m in markets.items():
-        if not m:
-            continue
-        if not m.get("active", True):
+        if not m or not m.get("active", True):
             continue
         if m.get("type") != "swap" and not m.get("swap", False):
             continue
@@ -312,7 +302,6 @@ def build_universe_symbols(ex: ccxt.Exchange, cfg: dict) -> List[str]:
     for sym in candidates:
         t = tickers.get(sym) or {}
         qv = t.get("quoteVolume")
-
         if qv is None:
             bv = t.get("baseVolume")
             last = t.get("last")
@@ -321,14 +310,11 @@ def build_universe_symbols(ex: ccxt.Exchange, cfg: dict) -> List[str]:
                     qv = float(bv) * float(last)
                 except Exception:
                     qv = None
-
         if qv is None:
             continue
-
         qv = float(qv)
         if qv < min_qv:
             continue
-
         scored.append((sym, qv))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -373,62 +359,107 @@ def shard_symbols(r: Redis, symbols: List[str], cfg: dict) -> List[str]:
 
     idx_raw = r.get(state_key)
     idx = int(idx_raw) if idx_raw is not None else 0
-    idx = idx % n
+    idx %= n
 
     end = idx + per_run
-    if end <= n:
-        chunk = symbols[idx:end]
-    else:
-        chunk = symbols[idx:] + symbols[:(end % n)]
+    chunk = symbols[idx:end] if end <= n else symbols[idx:] + symbols[:(end % n)]
 
     next_idx = (idx + step) % n
     r.set(state_key, str(next_idx), ex=30 * 24 * 3600)
-
     return chunk
 
 
 # =========================
-# Strategy: Trend Pullback v1
+# Strategy + confidence
 # =========================
 
-def compute_confidence(df: pd.DataFrame, side: str) -> float:
+def candle_momentum_ratio(row: pd.Series) -> float:
+    hi = float(row["high"])
+    lo = float(row["low"])
+    cl = float(row["close"])
+    rng = hi - lo
+    if not math.isfinite(rng) or rng <= 0:
+        return 0.5
+    return (cl - lo) / rng  # 0..1 (close near high = 1)
+
+def compute_confidence_components(cfg: dict, df: pd.DataFrame, side: str) -> Dict[str, float]:
+    s = cfg["strategy"]
     last = df.iloc[-1]
+
     atrv = float(last["atr"])
     if not math.isfinite(atrv) or atrv <= 0:
-        return 0.0
+        return {"confidence": 0.0}
 
-    dist = (float(last["close"]) - float(last["ema_trend"])) / atrv
-    if side == "SHORT":
-        dist = -dist
+    close = float(last["close"])
+    ema_tr = float(last["ema_trend"])
+    slope = float(last["ema_trend_slope"])  # EMA trend slope over lookback
+    slope_atr = slope / atrv  # signed
+    dist_atr = abs((close - ema_tr) / atrv)  # magnitude
 
-    score = 1 / (1 + math.exp(-(dist - 0.5)))
-    return float(np.clip(score, 0.0, 1.0))
+    # pullback depth: how far previous close was beyond ema_fast
+    prev = df.iloc[-2]
+    prev_close = float(prev["close"])
+    prev_ema_fast = float(prev["ema_fast"])
+    pull_depth_atr = abs(prev_ema_fast - prev_close) / atrv
 
-def build_trend_pullback_signal(
-    cfg: dict,
-    df: pd.DataFrame,
-    symbol: str,
-    tf: str,
-    exchange: str,
-    market: str,
-) -> Optional[Dict[str, Any]]:
-    s_cfg = cfg["strategy"]
+    mom = candle_momentum_ratio(last)
+    mom_for_side = mom if side == "LONG" else (1.0 - mom)  # short wants close near low
 
-    ema_fast_n = int(s_cfg["ema_fast"])
-    ema_trend_n = int(s_cfg["ema_trend"])
-    atr_n = int(s_cfg["atr_period"])
+    # normalize to 0..1
+    # trend strength: require sign; score grows from min -> (min+1)
+    min_slope = float(s.get("trend_slope_min_atr", 0.2))
+    ts = abs(slope_atr)
+    trend_strength = clamp((ts - min_slope) / 1.0, 0.0, 1.0)
 
-    if len(df) < max(ema_trend_n, atr_n) + 5:
+    # distance from EMA trend: prefer not too close, not too far (peak around ~1 ATR)
+    dist_score = 1.0 - clamp(abs(dist_atr - 1.0) / 1.5, 0.0, 1.0)
+
+    # pullback depth: prefer within bounds, peak around mid
+    pb_min = float(s.get("pullback_min_atr", 0.15))
+    pb_max = float(s.get("pullback_max_atr", 1.5))
+    if pull_depth_atr < pb_min or pull_depth_atr > pb_max:
+        pull_score = 0.0
+    else:
+        mid = (pb_min + pb_max) / 2.0
+        pull_score = 1.0 - clamp(abs(pull_depth_atr - mid) / (pb_max - pb_min), 0.0, 1.0)
+
+    # momentum: map mom_for_side from [0.5..1] -> [0..1]
+    momentum_score = clamp((mom_for_side - 0.5) / 0.5, 0.0, 1.0)
+
+    # combine
+    confidence = clamp(0.35 * trend_strength + 0.25 * dist_score + 0.20 * pull_score + 0.20 * momentum_score, 0.0, 1.0)
+
+    return {
+        "confidence": float(confidence),
+        "trend_strength": float(trend_strength),
+        "dist_score": float(dist_score),
+        "pull_score": float(pull_score),
+        "momentum_score": float(momentum_score),
+        "slope_atr": float(slope_atr),
+        "dist_atr": float(dist_atr),
+        "pull_depth_atr": float(pull_depth_atr),
+        "mom": float(mom),
+    }
+
+def build_trend_pullback_signal(cfg: dict, df: pd.DataFrame, symbol: str, tf: str, exchange: str, market: str) -> Optional[Dict[str, Any]]:
+    s = cfg["strategy"]
+    ema_fast_n = int(s["ema_fast"])
+    ema_trend_n = int(s["ema_trend"])
+    atr_n = int(s["atr_period"])
+    slope_lb = int(s.get("trend_slope_lookback", 10))
+
+    if len(df) < max(ema_trend_n, atr_n) + slope_lb + 5:
         return None
 
     df = df.copy()
     df["ema_fast"] = ema(df["close"], ema_fast_n)
     df["ema_trend"] = ema(df["close"], ema_trend_n)
     df["atr"] = atr(df, atr_n)
+    df["ema_trend_slope"] = df["ema_trend"] - df["ema_trend"].shift(slope_lb)
+    df["atr_pct"] = df["atr"] / df["close"]
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
-
     candle_ts = int(last["ts"])
     if not is_candle_closed(candle_ts, tf):
         return None
@@ -441,30 +472,54 @@ def build_trend_pullback_signal(
     if not (math.isfinite(atr_v) and atr_v > 0):
         return None
 
-    trend_up = close > ema_trend_v
-    trend_down = close < ema_trend_v
+    # --- New: ATR% filter
+    atr_pct = float(last["atr_pct"])
+    atr_pct_min = float(s.get("atr_pct_min", 0.0))
+    atr_pct_max = float(s.get("atr_pct_max", 999.0))
+    if not (atr_pct_min <= atr_pct <= atr_pct_max):
+        return None
 
-    pullback_long = (
-        trend_up
-        and float(prev["close"]) < float(prev["ema_fast"])
-        and close > ema_fast_v
-    )
-    pullback_short = (
-        trend_down
-        and float(prev["close"]) > float(prev["ema_fast"])
-        and close < ema_fast_v
-    )
+    # --- New: trend slope filter (signed)
+    slope = float(last["ema_trend_slope"])
+    slope_atr = slope / atr_v
+    min_slope_atr = float(s.get("trend_slope_min_atr", 0.2))
 
+    trend_up = close > ema_trend_v and slope_atr >= min_slope_atr
+    trend_down = close < ema_trend_v and slope_atr <= -min_slope_atr
+
+    # --- Pullback reclaim condition
+    pullback_long = trend_up and float(prev["close"]) < float(prev["ema_fast"]) and close > ema_fast_v
+    pullback_short = trend_down and float(prev["close"]) > float(prev["ema_fast"]) and close < ema_fast_v
     if not (pullback_long or pullback_short):
         return None
 
     side = "LONG" if pullback_long else "SHORT"
+
+    # --- New: pullback depth filter
+    prev_close = float(prev["close"])
+    prev_ema_fast = float(prev["ema_fast"])
+    pull_depth_atr = abs(prev_ema_fast - prev_close) / atr_v
+    pb_min = float(s.get("pullback_min_atr", 0.15))
+    pb_max = float(s.get("pullback_max_atr", 1.5))
+    if pull_depth_atr < pb_min or pull_depth_atr > pb_max:
+        return None
+
+    # --- New: candle momentum filter
+    mom = candle_momentum_ratio(last)
+    mom_for_side = mom if side == "LONG" else (1.0 - mom)
+    mom_min = float(s.get("momentum_min", 0.55))
+    if mom_for_side < mom_min:
+        return None
+
+    # Entry model
     entry = close
 
-    stop_mult = float(s_cfg["stop_atr_mult"])
-    tp1_r = float(s_cfg["tp1_r"])
-    tp2_r = float(s_cfg["tp2_r"])
-    trail_mult = float(s_cfg["trail_atr_mult"])
+    # Stops/targets
+    stop_mult = float(s["stop_atr_mult"])
+    tp1_r = float(s["tp1_r"])
+    tp2_r = float(s["tp2_r"])
+    trail_mult = float(s["trail_atr_mult"])
+    trail_activation = str(s.get("trail_activation", "after_tp1"))
 
     stop = entry - stop_mult * atr_v if side == "LONG" else entry + stop_mult * atr_v
     risk = abs(entry - stop)
@@ -474,7 +529,8 @@ def build_trend_pullback_signal(
     tp1 = entry + tp1_r * risk if side == "LONG" else entry - tp1_r * risk
     tp2 = entry + tp2_r * risk if side == "LONG" else entry - tp2_r * risk
 
-    confidence = compute_confidence(df, side)
+    comps = compute_confidence_components(cfg, df, side)
+    confidence = float(comps["confidence"])
 
     raw_id = json.dumps({
         "exchange": exchange,
@@ -482,7 +538,8 @@ def build_trend_pullback_signal(
         "symbol": symbol,
         "tf": tf,
         "candle_ts": candle_ts,
-        "setup": s_cfg["name"],
+        "setup": s["name"],
+        "version": s.get("version", "v0"),
         "side": side,
     }, sort_keys=True)
     signal_id = sha256_hex(raw_id)[:24]
@@ -494,9 +551,11 @@ def build_trend_pullback_signal(
         "market": market,
         "symbol": symbol,
         "timeframe": tf,
-        "setup": s_cfg["name"],
+        "setup": s["name"],
+        "strategy_version": s.get("version", "v0"),
         "side": side,
-        "confidence": round(float(confidence), 4),
+        "confidence": round(confidence, 4),
+        "confidence_components": {k: round(float(v), 4) for k, v in comps.items() if k != "confidence"},
         "entry_model": "signal_close",
         "entry": {"type": "market", "price": round_price(entry)},
         "exit": {
@@ -505,18 +564,19 @@ def build_trend_pullback_signal(
             "trail": {
                 "method": "atr_chandelier",
                 "mult": trail_mult,
-                "activation": "after_tp1" if bool(s_cfg.get("trail_activate_after_tp1", True)) else "immediate",
+                "activation": trail_activation,
             },
+            "breakeven_after_tp1": bool(s.get("breakeven_after_tp1", True)),
+            "breakeven_offset_r": float(s.get("breakeven_offset_r", 0.0)),
         },
-        "invalidation": f"Close crosses EMA{ema_trend_n} against direction",
+        "invalidation": f"Trend weakens (EMA{int(s['ema_trend'])} slope flips) or close crosses EMA{int(s['ema_trend'])} against direction",
         "rationale": [
-            f"Trend filter: close vs EMA{ema_trend_n}",
-            f"Pullback reclaim EMA{ema_fast_n}",
-            f"ATR({atr_n}) risk model",
+            f"Trend: close vs EMA{ema_trend_n} + slope filter (lookback {slope_lb})",
+            f"Pullback: reclaim EMA{ema_fast_n}",
+            f"ATR% filter: [{s.get('atr_pct_min')}..{s.get('atr_pct_max')}]",
+            f"Momentum filter: >= {mom_min}",
         ],
-        # performance params (explicit)
         "perf": {
-            "risk_r": 1.0,
             "tp1_fraction": 0.5,
             "tp2_fraction": 0.5,
         }
@@ -525,11 +585,11 @@ def build_trend_pullback_signal(
 
 
 # =========================
-# Performance tracking
+# Performance tracking (versioned)
 # =========================
 
-def get_metrics(r: Redis) -> Dict[str, Any]:
-    raw = r.get(k_metrics_global())
+def get_metrics(r: Redis, sk: str) -> Dict[str, Any]:
+    raw = r.get(k_metrics(sk))
     if raw:
         try:
             return json.loads(raw)
@@ -546,95 +606,105 @@ def get_metrics(r: Redis) -> Dict[str, Any]:
         "last_update_ts": 0,
     }
 
-def save_metrics(r: Redis, m: Dict[str, Any]) -> None:
-    r.set(k_metrics_global(), json.dumps(m), ex=90 * 24 * 3600)
+def save_metrics(r: Redis, sk: str, m: Dict[str, Any]) -> None:
+    r.set(k_metrics(sk), json.dumps(m), ex=180 * 24 * 3600)
 
-def update_metrics_on_close(r: Redis, closed_trade: Dict[str, Any]) -> None:
-    m = get_metrics(r)
+def update_metrics_on_close(r: Redis, sk: str, closed_trade: Dict[str, Any]) -> None:
+    m = get_metrics(r, sk)
     m["trades"] += 1
     r_mult = float(closed_trade["r_multiple"])
     m["sum_r"] = float(m["sum_r"]) + r_mult
-
     if r_mult > 0:
         m["wins"] += 1
     else:
         m["losses"] += 1
-
     m["equity_r"] = float(m["equity_r"]) + r_mult
     m["peak_equity_r"] = max(float(m["peak_equity_r"]), float(m["equity_r"]))
     dd = float(m["peak_equity_r"]) - float(m["equity_r"])
     m["max_drawdown_r"] = max(float(m["max_drawdown_r"]), dd)
     m["last_update_ts"] = now_ts()
-    save_metrics(r, m)
+    save_metrics(r, sk, m)
 
-def open_trade_exists(r: Redis, signal_id: str) -> bool:
-    return r.exists(k_open_trade(signal_id)) == 1
+def open_trade_exists(r: Redis, sk: str, signal_id: str) -> bool:
+    return r.exists(k_open_trade(sk, signal_id)) == 1
 
-def create_open_trade(r: Redis, sig: Dict[str, Any], strategy_cfg: Dict[str, Any]) -> None:
-    """
-    Create an open "virtual" trade for performance tracking.
-    Deterministic entry model = signal close price at sig['ts'].
-    """
+def r_for_exit(side: str, entry: float, exit_price: float, risk: float) -> float:
+    if risk <= 0:
+        return 0.0
+    return (exit_price - entry) / risk if side == "LONG" else (entry - exit_price) / risk
+
+def create_open_trade(r: Redis, sk: str, sig: Dict[str, Any], cfg: dict) -> None:
     sid = sig["signal_id"]
-    if open_trade_exists(r, sid):
+    if open_trade_exists(r, sk, sid):
         return
 
+    s = cfg["strategy"]
     entry = float(sig["entry"]["price"])
     stop0 = float(sig["exit"]["stop"])
     tp1 = float(sig["exit"]["take_profit"][0])
     tp2 = float(sig["exit"]["take_profit"][1])
     side = sig["side"]
-
     risk = abs(entry - stop0)
     if risk <= 0:
         return
 
     trail_mult = float(sig["exit"]["trail"]["mult"])
     trail_activation = sig["exit"]["trail"].get("activation", "after_tp1")
-    atr_period = int(strategy_cfg["atr_period"])
 
     trade = {
         "signal_id": sid,
+        "strategy_key": sk,
         "exchange": sig["exchange"],
         "market": sig["market"],
         "symbol": sig["symbol"],
         "timeframe": sig["timeframe"],
         "side": side,
         "setup": sig.get("setup", ""),
+        "strategy_version": sig.get("strategy_version", "v0"),
+
         "opened_ts": int(sig["ts"]),
         "entry": entry,
         "stop0": stop0,
         "tp1": tp1,
         "tp2": tp2,
         "risk": risk,
+
         "tp1_fraction": float(sig.get("perf", {}).get("tp1_fraction", 0.5)),
         "tp2_fraction": float(sig.get("perf", {}).get("tp2_fraction", 0.5)),
+
         "trail_mult": trail_mult,
         "trail_activation": trail_activation,
-        "atr_period": atr_period,
+        "trail_require_trend_valid": bool(s.get("trail_require_trend_valid", True)),
+        "ema_fast_n": int(s.get("ema_fast", 20)),
+        "atr_period": int(s.get("atr_period", 14)),
 
-        "status": "OPEN",
+        "breakeven_after_tp1": bool(sig["exit"].get("breakeven_after_tp1", True)),
+        "breakeven_offset_r": float(sig["exit"].get("breakeven_offset_r", 0.0)),
+
         "tp1_hit": False,
-        "current_stop": stop0,     # may trail after TP1
-        "highest_high": entry,      # for long trail
-        "lowest_low": entry,        # for short trail
-        "last_checked_ts": int(sig["ts"]),  # process candles strictly after entry candle
+        "current_stop": stop0,
+        "highest_high": entry,
+        "lowest_low": entry,
+        "last_checked_ts": int(sig["ts"]),
+        "_tp1_r_cache": None,
     }
 
     pipe = r.pipeline()
-    pipe.set(k_open_trade(sid), json.dumps(trade), ex=30 * 24 * 3600)
-    pipe.sadd(k_open_set(), sid)
+    pipe.set(k_open_trade(sk, sid), json.dumps(trade), ex=30 * 24 * 3600)
+    pipe.sadd(k_open_set(sk), sid)
     pipe.execute()
 
-def close_trade(r: Redis, trade: Dict[str, Any], exit_price: float, exit_ts: int, exit_reason: str, total_r: float) -> None:
+def close_trade(r: Redis, sk: str, trade: Dict[str, Any], exit_price: float, exit_ts: int, reason: str, total_r: float, keep: int) -> None:
     closed = {
         "signal_id": trade["signal_id"],
+        "strategy_key": sk,
         "exchange": trade["exchange"],
         "market": trade["market"],
         "symbol": trade["symbol"],
         "timeframe": trade["timeframe"],
         "side": trade["side"],
         "setup": trade.get("setup", ""),
+        "strategy_version": trade.get("strategy_version", "v0"),
         "opened_ts": trade["opened_ts"],
         "closed_ts": exit_ts,
         "entry": trade["entry"],
@@ -642,44 +712,26 @@ def close_trade(r: Redis, trade: Dict[str, Any], exit_price: float, exit_ts: int
         "tp1": trade["tp1"],
         "tp2": trade["tp2"],
         "exit_price": float(exit_price),
-        "exit_reason": exit_reason,
+        "exit_reason": reason,
         "r_multiple": round(float(total_r), 6),
     }
 
     pipe = r.pipeline()
-    pipe.lpush(k_closed_list(), json.dumps(closed))
-    pipe.ltrim(k_closed_list(), 0, 5000)  # keep last 5000 closed trades
-    pipe.delete(k_open_trade(trade["signal_id"]))
-    pipe.srem(k_open_set(), trade["signal_id"])
+    pipe.lpush(k_closed_list(sk), json.dumps(closed))
+    pipe.ltrim(k_closed_list(sk), 0, max(1000, int(keep)))
+    pipe.delete(k_open_trade(sk, trade["signal_id"]))
+    pipe.srem(k_open_set(sk), trade["signal_id"])
     pipe.execute()
 
-    update_metrics_on_close(r, closed)
+    update_metrics_on_close(r, sk, closed)
 
-def r_for_exit(side: str, entry: float, exit_price: float, risk: float) -> float:
-    if risk <= 0:
-        return 0.0
+def candle_hits(side: str, candle: Dict[str, float], level: float, kind: str) -> bool:
     if side == "LONG":
-        return (exit_price - entry) / risk
-    return (entry - exit_price) / risk
-
-def candle_hits_long(candle: Dict[str, float], level: float, kind: str) -> bool:
-    # kind: "stop" uses low <= level, "tp" uses high >= level
-    if kind == "stop":
-        return candle["low"] <= level
-    return candle["high"] >= level
-
-def candle_hits_short(candle: Dict[str, float], level: float, kind: str) -> bool:
-    # short: stop if high >= level, tp if low <= level
-    if kind == "stop":
-        return candle["high"] >= level
-    return candle["low"] <= level
+        return candle["low"] <= level if kind == "stop" else candle["high"] >= level
+    else:
+        return candle["high"] >= level if kind == "stop" else candle["low"] <= level
 
 def update_trade_with_candles(trade: Dict[str, Any], df: pd.DataFrame) -> Optional[Tuple[float, int, str, float]]:
-    """
-    Process candles after trade['last_checked_ts'] and decide if trade closes.
-    Returns (exit_price, exit_ts, reason, total_r) if closed, else None.
-    """
-
     side = trade["side"]
     entry = float(trade["entry"])
     risk = float(trade["risk"])
@@ -689,18 +741,22 @@ def update_trade_with_candles(trade: Dict[str, Any], df: pd.DataFrame) -> Option
     tp2_frac = float(trade["tp2_fraction"])
     trail_mult = float(trade["trail_mult"])
     atr_period = int(trade["atr_period"])
+    ema_fast_n = int(trade["ema_fast_n"])
 
-    # Build ATR for trailing
     df = df.copy()
     df["atr"] = atr(df, atr_period)
+    df["ema_fast"] = ema(df["close"], ema_fast_n)
 
-    # Only consider candles strictly AFTER entry candle open ts
     last_checked = int(trade["last_checked_ts"])
     df2 = df[df["ts"] > last_checked].copy()
     if df2.empty:
         return None
 
-    # Helpers for hit tests
+    trail_activation = trade.get("trail_activation", "after_tp1")
+    require_trend_valid = bool(trade.get("trail_require_trend_valid", True))
+    be_after_tp1 = bool(trade.get("breakeven_after_tp1", True))
+    be_offset_r = float(trade.get("breakeven_offset_r", 0.0))
+
     for _, row in df2.iterrows():
         c = {
             "ts": int(row["ts"]),
@@ -709,93 +765,28 @@ def update_trade_with_candles(trade: Dict[str, Any], df: pd.DataFrame) -> Option
             "low": float(row["low"]),
             "close": float(row["close"]),
         }
+        atrv = float(row["atr"]) if math.isfinite(float(row["atr"])) else None
+        ema_fast_v = float(row["ema_fast"]) if math.isfinite(float(row["ema_fast"])) else None
 
-        # Update extremes for trailing
+        # Update extremes
         if side == "LONG":
             trade["highest_high"] = max(float(trade["highest_high"]), c["high"])
         else:
             trade["lowest_low"] = min(float(trade["lowest_low"]), c["low"])
 
-        # Determine current stop (may trail after TP1)
         current_stop = float(trade["current_stop"])
         tp1_hit = bool(trade["tp1_hit"])
 
-        # Worst-case collision rule: if stop and tp in same candle -> stop first.
-        if side == "LONG":
-            stop_hit = candle_hits_long(c, current_stop, "stop")
-            tp1_hit_now = candle_hits_long(c, tp1, "tp")
-            tp2_hit_now = candle_hits_long(c, tp2, "tp")
+        # Decide if trailing is active
+        trail_active = (trail_activation == "immediate") or tp1_hit
 
-            if not tp1_hit:
-                # before TP1: SL or TP1 possible
-                if stop_hit and tp1_hit_now:
-                    # worst-case: stop first
-                    total_r = -1.0
-                    return (current_stop, c["ts"], "STOP_BEFORE_TP1_COLLISION", total_r)
-                if stop_hit:
-                    total_r = -1.0
-                    return (current_stop, c["ts"], "STOP_BEFORE_TP1", total_r)
-                if tp1_hit_now:
-                    trade["tp1_hit"] = True
-                    tp1_hit = True
-                    # after TP1, trailing may start
-            else:
-                # after TP1: check stop first (worst-case), then TP2
-                stop_hit = candle_hits_long(c, current_stop, "stop")
-                tp2_hit_now = candle_hits_long(c, tp2, "tp")
-                if stop_hit and tp2_hit_now:
-                    # worst-case: stop first
-                    rem_r = r_for_exit(side, entry, current_stop, risk)
-                    total_r = tp1_frac * float(trade.get("_tp1_r_cache", r_for_exit(side, entry, tp1, risk))) + tp2_frac * rem_r
-                    return (current_stop, c["ts"], "TRAIL_STOP_COLLISION", total_r)
-                if stop_hit:
-                    rem_r = r_for_exit(side, entry, current_stop, risk)
-                    total_r = tp1_frac * float(trade.get("_tp1_r_cache", r_for_exit(side, entry, tp1, risk))) + tp2_frac * rem_r
-                    return (current_stop, c["ts"], "TRAIL_STOP", total_r)
-                if tp2_hit_now:
-                    rem_r = r_for_exit(side, entry, tp2, risk)
-                    total_r = tp1_frac * float(trade.get("_tp1_r_cache", r_for_exit(side, entry, tp1, risk))) + tp2_frac * rem_r
-                    return (tp2, c["ts"], "TP2", total_r)
+        # Optional: update trailing stop (chandelier) only when trend is valid (EMA_fast)
+        if trail_active and atrv and atrv > 0:
+            trend_ok = True
+            if require_trend_valid and ema_fast_v is not None:
+                trend_ok = (c["close"] >= ema_fast_v) if side == "LONG" else (c["close"] <= ema_fast_v)
 
-        else:
-            # SHORT
-            stop_hit = candle_hits_short(c, current_stop, "stop")
-            tp1_hit_now = candle_hits_short(c, tp1, "tp")
-            tp2_hit_now = candle_hits_short(c, tp2, "tp")
-
-            if not tp1_hit:
-                if stop_hit and tp1_hit_now:
-                    total_r = -1.0
-                    return (current_stop, c["ts"], "STOP_BEFORE_TP1_COLLISION", total_r)
-                if stop_hit:
-                    total_r = -1.0
-                    return (current_stop, c["ts"], "STOP_BEFORE_TP1", total_r)
-                if tp1_hit_now:
-                    trade["tp1_hit"] = True
-                    tp1_hit = True
-            else:
-                stop_hit = candle_hits_short(c, current_stop, "stop")
-                tp2_hit_now = candle_hits_short(c, tp2, "tp")
-                if stop_hit and tp2_hit_now:
-                    rem_r = r_for_exit(side, entry, current_stop, risk)
-                    total_r = tp1_frac * float(trade.get("_tp1_r_cache", r_for_exit(side, entry, tp1, risk))) + tp2_frac * rem_r
-                    return (current_stop, c["ts"], "TRAIL_STOP_COLLISION", total_r)
-                if stop_hit:
-                    rem_r = r_for_exit(side, entry, current_stop, risk)
-                    total_r = tp1_frac * float(trade.get("_tp1_r_cache", r_for_exit(side, entry, tp1, risk))) + tp2_frac * rem_r
-                    return (current_stop, c["ts"], "TRAIL_STOP", total_r)
-                if tp2_hit_now:
-                    rem_r = r_for_exit(side, entry, tp2, risk)
-                    total_r = tp1_frac * float(trade.get("_tp1_r_cache", r_for_exit(side, entry, tp1, risk))) + tp2_frac * rem_r
-                    return (tp2, c["ts"], "TP2", total_r)
-
-        # If TP1 got hit at some point, cache its R and update trailing stop on candle close
-        if trade["tp1_hit"] and "_tp1_r_cache" not in trade:
-            trade["_tp1_r_cache"] = r_for_exit(side, entry, tp1, risk)
-
-        if trade["tp1_hit"]:
-            atrv = float(row["atr"]) if math.isfinite(float(row["atr"])) else None
-            if atrv and atrv > 0:
+            if trend_ok:
                 if side == "LONG":
                     new_stop = float(trade["highest_high"]) - trail_mult * atrv
                     trade["current_stop"] = max(float(trade["current_stop"]), new_stop)
@@ -803,67 +794,114 @@ def update_trade_with_candles(trade: Dict[str, Any], df: pd.DataFrame) -> Option
                     new_stop = float(trade["lowest_low"]) + trail_mult * atrv
                     trade["current_stop"] = min(float(trade["current_stop"]), new_stop)
 
+            current_stop = float(trade["current_stop"])
+
+        # Hit tests (worst-case: stop first on collision)
+        stop_hit = candle_hits(side, c, current_stop, "stop")
+        tp1_hit_now = candle_hits(side, c, tp1, "tp")
+        tp2_hit_now = candle_hits(side, c, tp2, "tp")
+
+        if not tp1_hit:
+            if stop_hit and tp1_hit_now:
+                # worst-case: stop first
+                total_r = r_for_exit(side, entry, current_stop, risk)
+                return (current_stop, c["ts"], "STOP_COLLISION_BEFORE_TP1", total_r)
+
+            if stop_hit:
+                total_r = r_for_exit(side, entry, current_stop, risk)
+                return (current_stop, c["ts"], "STOP_BEFORE_TP1", total_r)
+
+            if tp1_hit_now:
+                trade["tp1_hit"] = True
+                trade["_tp1_r_cache"] = r_for_exit(side, entry, tp1, risk)
+
+                # breakeven move
+                if be_after_tp1:
+                    be_stop = entry + (be_offset_r * risk) if side == "LONG" else entry - (be_offset_r * risk)
+                    if side == "LONG":
+                        trade["current_stop"] = max(float(trade["current_stop"]), be_stop)
+                    else:
+                        trade["current_stop"] = min(float(trade["current_stop"]), be_stop)
+
+        else:
+            # After TP1: stop first (worst-case), then TP2
+            if stop_hit and tp2_hit_now:
+                rem_r = r_for_exit(side, entry, current_stop, risk)
+                tp1_r = float(trade.get("_tp1_r_cache") or r_for_exit(side, entry, tp1, risk))
+                total_r = tp1_frac * tp1_r + tp2_frac * rem_r
+                return (current_stop, c["ts"], "STOP_COLLISION_AFTER_TP1", total_r)
+
+            if stop_hit:
+                rem_r = r_for_exit(side, entry, current_stop, risk)
+                tp1_r = float(trade.get("_tp1_r_cache") or r_for_exit(side, entry, tp1, risk))
+                total_r = tp1_frac * tp1_r + tp2_frac * rem_r
+                return (current_stop, c["ts"], "TRAIL_STOP", total_r)
+
+            if tp2_hit_now:
+                rem_r = r_for_exit(side, entry, tp2, risk)
+                tp1_r = float(trade.get("_tp1_r_cache") or r_for_exit(side, entry, tp1, risk))
+                total_r = tp1_frac * tp1_r + tp2_frac * rem_r
+                return (tp2, c["ts"], "TP2", total_r)
+
         trade["last_checked_ts"] = c["ts"]
 
     return None
 
-def update_open_trades(r: Redis, ex: ccxt.Exchange, cfg: dict) -> int:
-    """
-    Update all open trades and close those that hit exits.
-    Returns number of trades closed this run.
-    """
-    ids = list(r.smembers(k_open_set()))
+def update_open_trades(r: Redis, ex: ccxt.Exchange, cfg: dict, sk: str) -> int:
+    if not cfg.get("performance", {}).get("enable", True):
+        return 0
+
+    ids = list(r.smembers(k_open_set(sk)))
     if not ids:
         return 0
 
     closed = 0
     limit = int(cfg["strategy"]["candles_limit"])
+    keep = int(cfg.get("performance", {}).get("closed_trades_keep", 20000))
 
     for sid in ids:
-        raw = r.get(k_open_trade(sid))
+        raw = r.get(k_open_trade(sk, sid))
         if not raw:
-            r.srem(k_open_set(), sid)
+            r.srem(k_open_set(sk), sid)
             continue
 
         try:
             trade = json.loads(raw)
         except Exception:
-            r.delete(k_open_trade(sid))
-            r.srem(k_open_set(), sid)
+            r.delete(k_open_trade(sk, sid))
+            r.srem(k_open_set(sk), sid)
             continue
 
         symbol = trade["symbol"]
         tf = trade["timeframe"]
 
-        # Fetch candles and evaluate only closed candles up to latest closed ts
         try:
             df = fetch_ohlcv_ccxt(ex, symbol, tf, limit=limit)
             closed_ts = latest_closed_candle_ts(df, tf)
             df_eval = df[df["ts"] <= closed_ts].copy()
         except Exception as e:
-            # don't kill the whole cron run
             print(f"[WARN] trade update fetch failed {symbol} {tf}: {repr(e)}")
             continue
 
         res = update_trade_with_candles(trade, df_eval)
         if res is None:
-            # persist updated trade state (last_checked/current_stop/extremes)
-            r.set(k_open_trade(sid), json.dumps(trade), ex=30 * 24 * 3600)
+            r.set(k_open_trade(sk, sid), json.dumps(trade), ex=30 * 24 * 3600)
             continue
 
         exit_price, exit_ts, reason, total_r = res
-        close_trade(r, trade, exit_price=exit_price, exit_ts=exit_ts, exit_reason=reason, total_r=total_r)
+        close_trade(r, sk, trade, exit_price=exit_price, exit_ts=exit_ts, reason=reason, total_r=total_r, keep=keep)
         closed += 1
 
     return closed
 
 
 # =========================
-# Main cron run (sync)
+# Main cron run
 # =========================
 
 def run_once(config_path: str = "candlepilot.config.yaml") -> None:
     cfg = load_config(config_path)
+    sk = strategy_key(cfg)
 
     redis_url = env_required(cfg["redis"]["url_env"])
     r = Redis.from_url(redis_url, decode_responses=True, socket_timeout=10)
@@ -893,15 +931,14 @@ def run_once(config_path: str = "candlepilot.config.yaml") -> None:
     except Exception as e:
         print(f"[WARN] load_markets failed: {repr(e)} (continuing)")
 
-    # 1) Update open trades FIRST (performance tracking)
-    closed_now = update_open_trades(r, ex, cfg)
+    # 1) update open trades first
+    closed_now = update_open_trades(r, ex, cfg, sk)
 
-    # Universe symbols
+    # universe
     if cfg.get("universe", {}).get("enable", False):
         symbols = get_universe_symbols_cached(r, ex, cfg, exchange_name, market)
     else:
         symbols = cfg["market"].get("symbols", []) or []
-
     scan_symbols = shard_symbols(r, symbols, cfg)
 
     posted = 0
@@ -914,50 +951,44 @@ def run_once(config_path: str = "candlepilot.config.yaml") -> None:
             scanned += 1
             try:
                 df = fetch_ohlcv_ccxt(ex, symbol, tf, limit=limit)
-
-                # use latest CLOSED candle for gating
                 closed_ts = latest_closed_candle_ts(df, tf)
                 if already_processed_candle(r, market, symbol, tf, closed_ts):
                     continue
-
                 df_eval = df[df["ts"] <= closed_ts].copy()
 
                 sig = build_trend_pullback_signal(cfg, df_eval, symbol, tf, exchange_name, market)
                 if not sig:
                     continue
-
                 if float(sig["confidence"]) < min_conf:
                     continue
 
-                # Optional anti-spam cooldown by candles
+                # cooldown
                 if cooldown_candles > 0:
                     cd_seconds = cooldown_candles * timeframe_to_seconds(tf)
-                    cd_key = cooldown_key(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"], sig["setup"])
+                    cd_key = cooldown_key(sig["exchange"], sig["market"], sig["symbol"], sig["timeframe"], sig["setup"], sk)
                     if in_cooldown(r, cd_key):
                         continue
                     set_cooldown(r, cd_key, cd_seconds)
 
-                # Store signal + create open trade for performance tracking
                 write_signal_to_redis(r, sig)
-                create_open_trade(r, sig, cfg["strategy"])
+                if cfg.get("performance", {}).get("enable", True):
+                    create_open_trade(r, sk, sig, cfg)
                 signals_created += 1
 
-                # Publish to Discord (dedupe)
                 if mark_published(r, sig["signal_id"], pub_ttl_days):
-                    msg = format_discord_message(sig)
-                    post_to_discord(webhook_url, msg, username=discord_username, avatar_url=discord_avatar)
+                    post_to_discord(webhook_url, format_discord_message(sig), username=discord_username, avatar_url=discord_avatar)
                     posted += 1
 
             except Exception as e:
                 errors += 1
                 print(f"[ERROR] {symbol} {tf}: {repr(e)}")
 
-    m = get_metrics(r)
+    m = get_metrics(r, sk)
     win_rate = (m["wins"] / m["trades"]) if m["trades"] else 0.0
     avg_r = (m["sum_r"] / m["trades"]) if m["trades"] else 0.0
 
     print(
-        f"[DONE] universe={len(symbols)} scanned={scanned} signals_created={signals_created} "
+        f"[DONE] strategy={sk} universe={len(symbols)} scanned={scanned} signals_created={signals_created} "
         f"posted={posted} closed_trades={closed_now} errors={errors} | "
         f"perf: trades={m['trades']} winrate={win_rate:.2%} avgR={avg_r:.3f} "
         f"equityR={m['equity_r']:.3f} maxDD={m['max_drawdown_r']:.3f}"
