@@ -17,52 +17,67 @@ mexc:
 
 market:
   exchange: "mexc"
-  market_type: "perp"      # we run swaps/perps via CCXT defaultType=swap
-  timeframes:
-    - "15m"
-    - "1h"
+  market_type: "perp"
+  timeframes: ["15m", "1h"]
 
 universe:
   enable: true
   quote: "USDT"
-
-  # CCXT swap symbols often look like BTC/USDT:USDT. Keep this true for perps.
   require_colon_quote: true
-
-  # Universe selection
   top_n: 200
   min_quote_volume_usdt: 3000000
   refresh_seconds: 3600
-
-  # Safety filters (optional)
-  whitelist: []     # if set, only scan these
-  blacklist: []     # always excluded
-
-  # Scan sharding (HIGHLY recommended on cron)
+  whitelist: []
+  blacklist: []
   shard:
     enable: true
     symbols_per_run: 60
     state_key: "universe_shard_index:mexc:perp"
-    # advance by this many symbols each cron tick
     step: 60
 
 strategy:
   name: "trend_pullback_v1"
-  min_confidence: 0.65
+  version: "v1.1.0"       # bump when you change logic/filters
+  min_confidence: 0.72
 
   ema_fast: 20
   ema_trend: 200
   atr_period: 14
 
+  # New: trend strength filter (EMA trend slope vs ATR)
+  trend_slope_lookback: 10
+  trend_slope_min_atr: 0.20   # slope must be >= 0.20 ATR (long) or <= -0.20 ATR (short)
+
+  # New: ATR% chop/spike filter
+  atr_pct_min: 0.002          # 0.2%
+  atr_pct_max: 0.020          # 2.0%
+
+  # New: pullback depth filter (in ATR)
+  pullback_min_atr: 0.15
+  pullback_max_atr: 1.50
+
+  # New: candle momentum filter (close location in candle)
+  momentum_min: 0.55          # long: close near high; short: close near low
+
   stop_atr_mult: 2.5
   tp1_r: 1.5
   tp2_r: 3.0
+
+  # Trailing behavior
   trail_atr_mult: 2.5
-  trail_activate_after_tp1: true
+  trail_activation: "after_tp1"   # "after_tp1" or "immediate"
+  trail_require_trend_valid: true  # only update trail when close is on correct side of EMA_fast
+
+  # New: move stop to breakeven after TP1
+  breakeven_after_tp1: true
+  breakeven_offset_r: 0.0          # 0.0 = true breakeven; -0.1 = allow small loss; +0.1 = lock profit
 
   candles_limit: 300
 
+performance:
+  enable: true
+  closed_trades_keep: 20000
+
 publishing:
   published_ttl_days: 7
-  # Optional: stop Discord spam in very active markets
   cooldown_candles: 3
